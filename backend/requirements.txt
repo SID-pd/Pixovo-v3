@@ -1,0 +1,29 @@
+# Pixovo-v3 Template Engine (PTE) Requirements
+# ---------------------------------------------
+
+# Web Framework & Server
+fastapi>=0.110.0
+uvicorn>=0.28.0
+python-multipart>=0.0.9
+pydantic>=2.6.0
+python-dotenv>=1.0.0
+loguru>=0.7.2
+
+# Image Processing & Computer Vision
+opencv-python-headless>=4.9.0.80
+numpy>=1.26.4
+pillow>=10.2.0
+pillow-heif>=0.16.0
+imagehash>=4.3.1
+
+# AI & Face Intelligence
+mediapipe>=0.10.11
+scikit-learn>=1.4.1.post1
+onnxruntime>=1.17.1
+google-genai>=0.1.0
+
+# Document & PDF Export Engine
+reportlab>=4.1.0
+
+# Testing & Utilities
+pytest>=8.0.0

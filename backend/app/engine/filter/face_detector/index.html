@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pixovo AI - High Precision Face Detector</title>
+
+  <!-- Google Fonts: Inter & Outfit -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@500;600;700;800&display=swap" rel="stylesheet">
+
+  <style>
+    :root {
+      --bg-gradient: linear-gradient(135deg, #0b0f19 0%, #111827 50%, #0f172a 100%);
+      --card-bg: rgba(30, 41, 59, 0.7);
+      --card-border: rgba(255, 255, 255, 0.08);
+      --accent-emerald: #10b981;
+      --accent-cyan: #06b6d4;
+      --accent-indigo: #6366f1;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --font-body: 'Inter', sans-serif;
+      --font-heading: 'Outfit', sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: var(--font-body);
+      background: var(--bg-gradient);
+      color: var(--text-main);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 1200px;
+    }
+
+    /* Header */
+    header {
+      text-align: center;
+      margin-bottom: 2.5rem;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.35rem 0.9rem;
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      border-radius: 9999px;
+      color: var(--accent-emerald);
+      font-size: 0.85rem;
+      font-weight: 600;
+      margin-bottom: 0.8rem;
+    }
+
+    .badge-dot {
+      width: 8px;
+      height: 8px;
+      background: var(--accent-emerald);
+      border-radius: 50%;
+      box-shadow: 0 0 10px var(--accent-emerald);
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(0.85); }
+    }
+
+    h1 {
+      font-family: var(--font-heading);
+      font-size: 2.75rem;
+      font-weight: 800;
+      background: linear-gradient(135deg, #ffffff 0%, #cbd5e1 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 0.5rem;
+    }
+
+    p.subtitle {
+      color: var(--text-muted);
+      font-size: 1.05rem;
+      max-width: 600px;
+      margin: 0 auto;
+    }
+
+    /* Dropzone */
+    .dropzone-card {
+      background: var(--card-bg);
+      backdrop-filter: blur(16px);
+      border: 2px dashed var(--card-border);
+      border-radius: 1.25rem;
+      padding: 3rem 2rem;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+      margin-bottom: 2rem;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .dropzone-card:hover, .dropzone-card.dragover {
+      border-color: var(--accent-emerald);
+      background: rgba(16, 185, 129, 0.05);
+      transform: translateY(-2px);
+      box-shadow: 0 15px 35px rgba(16, 185, 129, 0.15);
+    }
+
+    .upload-icon {
+      width: 64px;
+      height: 64px;
+      margin-bottom: 1rem;
+      color: var(--accent-emerald);
+    }
+
+    .dropzone-title {
+      font-family: var(--font-heading);
+      font-size: 1.35rem;
+      font-weight: 600;
+      margin-bottom: 0.5rem;
+    }
+
+    .dropzone-hint {
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      margin-bottom: 1.25rem;
+    }
+
+    .btn-select {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      background: linear-gradient(135deg, var(--accent-emerald) 0%, #059669 100%);
+      color: #000;
+      font-weight: 700;
+      padding: 0.75rem 1.5rem;
+      border-radius: 0.75rem;
+      border: none;
+      cursor: pointer;
+      font-size: 0.95rem;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+
+    .btn-select:hover {
+      transform: scale(1.03);
+      box-shadow: 0 5px 20px rgba(16, 185, 129, 0.4);
+    }
+
+    #fileInput {
+      display: none;
+    }
+
+    /* Loader */
+    .loader-container {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      padding: 2.5rem;
+      gap: 1rem;
+    }
+
+    .spinner {
+      width: 48px;
+      height: 48px;
+      border: 4px solid rgba(255, 255, 255, 0.1);
+      border-top-color: var(--accent-emerald);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    /* Results Section */
+    .results-section {
+      display: none;
+      animation: fadeIn 0.4s ease-out forwards;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* Stats Grid */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 1rem;
+      margin-bottom: 2rem;
+    }
+
+    .stat-card {
+      background: var(--card-bg);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--card-border);
+      border-radius: 1rem;
+      padding: 1.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+    }
+
+    .stat-label {
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-weight: 600;
+    }
+
+    .stat-value {
+      font-family: var(--font-heading);
+      font-size: 1.85rem;
+      font-weight: 700;
+      color: var(--text-main);
+    }
+
+    /* Image Comparison Grid */
+    .comparison-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      gap: 1.5rem;
+      margin-bottom: 2rem;
+    }
+
+    .image-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 1rem;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .image-header {
+      padding: 1rem 1.25rem;
+      background: rgba(15, 23, 42, 0.6);
+      font-weight: 600;
+      font-size: 0.95rem;
+      border-bottom: 1px solid var(--card-border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .image-container {
+      position: relative;
+      background: #000;
+      width: 100%;
+      min-height: 280px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .image-container img {
+      max-width: 100%;
+      max-height: 550px;
+      object-fit: contain;
+      display: block;
+    }
+
+    /* Faces Detailed Table */
+    .faces-table-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 1rem;
+      padding: 1.5rem;
+      overflow-x: auto;
+    }
+
+    .table-title {
+      font-family: var(--font-heading);
+      font-size: 1.2rem;
+      font-weight: 700;
+      margin-bottom: 1rem;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 0.9rem;
+    }
+
+    th {
+      color: var(--text-muted);
+      font-weight: 600;
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--card-border);
+    }
+
+    td {
+      padding: 0.85rem 1rem;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    }
+
+    tr:last-child td {
+      border-bottom: none;
+    }
+
+    .pill {
+      display: inline-block;
+      padding: 0.2rem 0.6rem;
+      border-radius: 9999px;
+      font-size: 0.78rem;
+      font-weight: 600;
+    }
+
+    .pill-major { background: rgba(16, 185, 129, 0.2); color: #34d399; }
+    .pill-minor { background: rgba(234, 179, 8, 0.2); color: #fde047; }
+
+    /* Footer */
+    footer {
+      margin-top: 3rem;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <!-- Header -->
+    <header>
+      <div class="badge">
+        <span class="badge-dot"></span>
+        <span>Pixovo Phase 1 AI Engine</span>
+      </div>
+      <h1>High-Precision Face Detector</h1>
+      <p class="subtitle">Upload any image to detect faces, mark spatial bounding boxes, grid regions, and dominance composition.</p>
+    </header>
+
+    <!-- Upload Dropzone -->
+    <div class="dropzone-card" id="dropzone">
+      <svg class="upload-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
+      </svg>
+      <div class="dropzone-title">Drag & drop your photo here</div>
+      <div class="dropzone-hint">Supports JPG, PNG, WEBP, BMP up to 25MB</div>
+      <button class="btn-select" onclick="document.getElementById('fileInput').click()">Browse Photo</button>
+      <input type="file" id="fileInput" accept="image/*">
+    </div>
+
+    <!-- Loader -->
+    <div class="loader-container" id="loader">
+      <div class="spinner"></div>
+      <div style="color: var(--text-muted); font-size: 0.95rem;">Analyzing faces and computing spatial position grid...</div>
+    </div>
+
+    <!-- Results Container -->
+    <div class="results-section" id="results">
+
+      <!-- Summary Stats Grid -->
+      <div class="stats-grid">
+        <div class="stat-card">
+          <span class="stat-label">Total Faces</span>
+          <span class="stat-value" id="statFaces" style="color: var(--accent-emerald);">0</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Major / Minor</span>
+          <span class="stat-value" id="statMajorMinor">0 / 0</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Composition Layout</span>
+          <span class="stat-value" id="statComposition" style="font-size: 1.25rem;">-</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Backend Model</span>
+          <span class="stat-value" id="statBackend" style="font-size: 1.1rem; color: var(--accent-cyan);">-</span>
+        </div>
+      </div>
+
+      <!-- Image Comparison -->
+      <div class="comparison-grid">
+        <div class="image-card">
+          <div class="image-header">
+            <span>📷 Original Photo</span>
+            <span id="imgDimensions" style="color: var(--text-muted); font-size: 0.8rem;">-</span>
+          </div>
+          <div class="image-container">
+            <img id="origImg" src="" alt="Original Photo">
+          </div>
+        </div>
+
+        <div class="image-card">
+          <div class="image-header">
+            <span style="color: var(--accent-emerald);">🎯 Marked Faces Output</span>
+            <span style="font-size: 0.8rem; color: var(--text-muted);">Annotated Bounding Boxes</span>
+          </div>
+          <div class="image-container">
+            <img id="annotatedImg" src="" alt="Annotated Photo">
+          </div>
+        </div>
+      </div>
+
+      <!-- Face Detailed Breakdown -->
+      <div class="faces-table-card">
+        <div class="table-title">Detected Faces Summary</div>
+        <table>
+          <thead>
+            <tr>
+              <th>Face ID</th>
+              <th>Grid Region (3x3)</th>
+              <th>Dominance</th>
+              <th>Area %</th>
+              <th>Orientation</th>
+              <th>Confidence</th>
+              <th>Bounding Box (x, y, w, h)</th>
+            </tr>
+          </thead>
+          <tbody id="facesTableBody">
+            <!-- Rows injected by JS -->
+          </tbody>
+        </table>
+      </div>
+
+    </div>
+
+    <!-- Footer -->
+    <footer>
+      Powered by Pixovo Multi-Scale Tiled Grid Scanning & OpenCV Deep Learning Engine
+    </footer>
+  </div>
+
+  <script>
+    const dropzone = document.getElementById('dropzone');
+    const fileInput = document.getElementById('fileInput');
+    const loader = document.getElementById('loader');
+    const results = document.getElementById('results');
+
+    // Drag and Drop handlers
+    ['dragenter', 'dragover'].forEach(eventName => {
+      dropzone.addEventListener(eventName, (e) => {
+        e.preventDefault();
+        dropzone.classList.add('dragover');
+      }, false);
+    });
+
+    ['dragleave', 'drop'].forEach(eventName => {
+      dropzone.addEventListener(eventName, (e) => {
+        e.preventDefault();
+        dropzone.classList.remove('dragover');
+      }, false);
+    });
+
+    dropzone.addEventListener('drop', (e) => {
+      const dt = e.dataTransfer;
+      const files = dt.files;
+      if (files.length > 0) {
+        processImage(files[0]);
+      }
+    });
+
+    fileInput.addEventListener('change', (e) => {
+      if (e.target.files.length > 0) {
+        processImage(e.target.files[0]);
+      }
+    });
+
+    function processImage(file) {
+      if (!file.type.startsWith('image/')) {
+        alert('Please upload a valid image file (JPG, PNG, WEBP, etc.)');
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const base64Data = e.target.result;
+        document.getElementById('origImg').src = base64Data;
+
+        // Show loader, hide results
+        loader.style.display = 'flex';
+        results.style.display = 'none';
+
+        // Send Base64 JSON payload to backend API
+        fetch('/api/detect', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ image: base64Data })
+        })
+        .then(async res => {
+          const rawText = await res.text();
+          let data;
+          try {
+            data = JSON.parse(rawText);
+          } catch(err) {
+            throw new Error(`Server returned status ${res.status}: ${rawText.substring(0, 150)}`);
+          }
+
+          if (!res.ok || !data.success) {
+            throw new Error(data.error || `Server error (${res.status})`);
+          }
+          return data;
+        })
+        .then(data => {
+          loader.style.display = 'none';
+          renderResults(data);
+        })
+        .catch(err => {
+          loader.style.display = 'none';
+          alert('Error: ' + err.message);
+        });
+      };
+
+      reader.readAsDataURL(file);
+    }
+
+    function renderResults(data) {
+      // Set images
+      document.getElementById('annotatedImg').src = data.annotated_image;
+      document.getElementById('imgDimensions').textContent = `${data.image_size[0]} x ${data.image_size[1]} px`;
+
+      // Set stats
+      document.getElementById('statFaces').textContent = data.face_count;
+      document.getElementById('statMajorMinor').textContent = `${data.major_face_count} / ${data.minor_face_count}`;
+      document.getElementById('statComposition').textContent = formatComposition(data.composition);
+      document.getElementById('statBackend').textContent = data.backend_used;
+
+      // Render table
+      const tbody = document.getElementById('facesTableBody');
+      tbody.innerHTML = '';
+
+      if (data.faces.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 1.5rem;">No faces detected in this image.</td></tr>`;
+      } else {
+        data.faces.forEach(f => {
+          const tr = document.createElement('tr');
+          const pillClass = f.dominance === 'major' ? 'pill-major' : 'pill-minor';
+          const confPct = (f.confidence * 100).toFixed(1) + '%';
+          const bboxStr = `(${f.box_pixels.join(', ')})`;
+
+          tr.innerHTML = `
+            <td><strong>#${f.face_id}</strong></td>
+            <td><code style="color: var(--accent-cyan); font-weight:600;">${f.grid_region_3x3.toUpperCase()}</code></td>
+            <td><span class="pill ${pillClass}">${f.dominance.toUpperCase()}</span></td>
+            <td>${f.area_percentage.toFixed(2)}%</td>
+            <td>${f.pose_orientation}</td>
+            <td>${confPct}</td>
+            <td><code style="color: var(--text-muted);">${bboxStr}</code></td>
+          `;
+          tbody.appendChild(tr);
+        });
+      }
+
+      results.style.display = 'block';
+    }
+
+    function formatComposition(comp) {
+      if (!comp) return '-';
+      return comp.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+    }
+  </script>
+</body>
+</html>

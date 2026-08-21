@@ -113,36 +113,42 @@ class SessionStore:
 
     @staticmethod
     def save_photos_batch(photos: List[PhotoMeta], session_id: Optional[str] = None) -> None:
+        """Atomic batch insert using executemany for high performance with up to 1000+ photos."""
+        if not photos:
+            return
         conn = get_db_connection()
         try:
+            records = [
+                (
+                    photo.id,
+                    session_id,
+                    photo.filename,
+                    photo.url,
+                    photo.preview_url or photo.url,
+                    photo.original_url,
+                    photo.thumbnail_url,
+                    1 if photo.original_synced else 0,
+                    photo.width,
+                    photo.height,
+                    photo.aspect_ratio,
+                    json.dumps(photo.dominant_colors or []),
+                    photo.score,
+                    photo.blur_score,
+                    photo.face_count,
+                    photo.shell_phash,
+                    photo.core_phash,
+                    1 if photo.is_hero_candidate else 0
+                )
+                for photo in photos
+            ]
             with conn:
-                for photo in photos:
-                    conn.execute("""
-                        INSERT OR REPLACE INTO photos (
-                            id, session_id, filename, url, preview_url, original_url, thumbnail_url,
-                            original_synced, width, height, aspect_ratio, dominant_colors_json,
-                            score, blur_score, face_count, shell_phash, core_phash, is_hero_candidate
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        photo.id,
-                        session_id,
-                        photo.filename,
-                        photo.url,
-                        photo.preview_url or photo.url,
-                        photo.original_url,
-                        photo.thumbnail_url,
-                        1 if photo.original_synced else 0,
-                        photo.width,
-                        photo.height,
-                        photo.aspect_ratio,
-                        json.dumps(photo.dominant_colors or []),
-                        photo.score,
-                        photo.blur_score,
-                        photo.face_count,
-                        photo.shell_phash,
-                        photo.core_phash,
-                        1 if photo.is_hero_candidate else 0
-                    ))
+                conn.executemany("""
+                    INSERT OR REPLACE INTO photos (
+                        id, session_id, filename, url, preview_url, original_url, thumbnail_url,
+                        original_synced, width, height, aspect_ratio, dominant_colors_json,
+                        score, blur_score, face_count, shell_phash, core_phash, is_hero_candidate
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, records)
         finally:
             conn.close()
 
@@ -179,17 +185,58 @@ class SessionStore:
 
     @staticmethod
     def get_photos(photo_ids: List[str]) -> List[PhotoMeta]:
+        """
+        Retrieves photos in safe batches of 500 to prevent SQLite 999 parameter placeholder limits
+        when fetching large sessions (e.g. 1000 photos).
+        """
         if not photo_ids:
             return []
         conn = get_db_connection()
         try:
-            placeholders = ",".join(["?"] * len(photo_ids))
-            cur = conn.cursor()
-            cur.execute(f"SELECT * FROM photos WHERE id IN ({placeholders})", photo_ids)
-            rows = cur.fetchall()
             results = {}
-            for row in rows:
-                results[row["id"]] = PhotoMeta(
+            chunk_size = 500
+            cur = conn.cursor()
+            for i in range(0, len(photo_ids), chunk_size):
+                chunk = photo_ids[i:i + chunk_size]
+                placeholders = ",".join(["?"] * len(chunk))
+                cur.execute(f"SELECT * FROM photos WHERE id IN ({placeholders})", chunk)
+                rows = cur.fetchall()
+                for row in rows:
+                    results[row["id"]] = PhotoMeta(
+                        id=row["id"],
+                        filename=row["filename"],
+                        url=row["url"],
+                        preview_url=row["preview_url"],
+                        original_url=row["original_url"],
+                        thumbnail_url=row["thumbnail_url"],
+                        original_synced=bool(row["original_synced"]),
+                        width=row["width"],
+                        height=row["height"],
+                        aspect_ratio=row["aspect_ratio"],
+                        dominant_colors=json.loads(row["dominant_colors_json"] or "[]"),
+                        score=row["score"],
+                        blur_score=row["blur_score"],
+                        face_count=row["face_count"],
+                        shell_phash=row["shell_phash"],
+                        core_phash=row["core_phash"],
+                        is_hero_candidate=bool(row["is_hero_candidate"])
+                    )
+            return [results[pid] for pid in photo_ids if pid in results]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_session_photos(session_id: str) -> List[PhotoMeta]:
+        """Retrieves all photos persisted under a given session_id."""
+        if not session_id:
+            return []
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM photos WHERE session_id = ? ORDER BY created_at ASC", (session_id,))
+            rows = cur.fetchall()
+            return [
+                PhotoMeta(
                     id=row["id"],
                     filename=row["filename"],
                     url=row["url"],
@@ -208,7 +255,8 @@ class SessionStore:
                     core_phash=row["core_phash"],
                     is_hero_candidate=bool(row["is_hero_candidate"])
                 )
-            return [results[pid] for pid in photo_ids if pid in results]
+                for row in rows
+            ]
         finally:
             conn.close()
 

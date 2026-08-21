@@ -122,9 +122,9 @@ def get_system_stats():
 
 @app.post("/api/photobook/ingest")
 async def ingest_photobook_dual_payload(
-    thumbnails: List[UploadFile] = File(...),
-    originals: List[UploadFile] = File(...),
-    metadata_json: str = Form(...)
+    thumbnails: Optional[List[UploadFile]] = File(default=[]),
+    originals: Optional[List[UploadFile]] = File(default=[]),
+    metadata_json: Optional[str] = Form(default="[]")
 ):
     """
     Phase 1 Ingestion Gateway Endpoint:
@@ -137,143 +137,163 @@ async def ingest_photobook_dual_payload(
     start_time = time.perf_counter()
     session_id = f"sess_{uuid.uuid4().hex[:8]}"
 
-    # 1. Validate & parse metadata JSON
+    thumbnails = thumbnails or []
+    originals = originals or []
+
+    if not thumbnails and not originals and (not metadata_json or metadata_json == "[]"):
+        logger.warning("[Ingest Error] Ingestion called with empty payload.")
+        raise HTTPException(status_code=400, detail="No photos or metadata received in ingestion payload.")
+
     try:
-        metadata_list = json.loads(metadata_json)
-    except Exception as e:
-        logger.error(f"[Ingest Error] Malformed metadata JSON: {e}")
-        raise HTTPException(status_code=400, detail=f"Invalid metadata JSON: {str(e)}")
+        # 1. Validate & parse metadata JSON
+        try:
+            metadata_list = json.loads(metadata_json) if metadata_json else []
+        except Exception as e:
+            logger.error(f"[Ingest Error] Malformed metadata JSON: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid metadata JSON: {str(e)}")
 
-    # 2. Setup Session-Specific Storage Directories
-    session_originals_dir = UPLOADS_ORIGINALS_DIR / session_id
-    session_thumbnails_dir = UPLOADS_THUMBNAILS_DIR / session_id
-    session_originals_dir.mkdir(parents=True, exist_ok=True)
-    session_thumbnails_dir.mkdir(parents=True, exist_ok=True)
+        # 2. Setup Session-Specific Storage Directories
+        session_originals_dir = UPLOADS_ORIGINALS_DIR / session_id
+        session_thumbnails_dir = UPLOADS_THUMBNAILS_DIR / session_id
+        session_originals_dir.mkdir(parents=True, exist_ok=True)
+        session_thumbnails_dir.mkdir(parents=True, exist_ok=True)
 
-    metadata_map = {m["photo_id"]: m for m in metadata_list}
+        metadata_map = {m["photo_id"]: m for m in metadata_list if isinstance(m, dict) and "photo_id" in m}
 
-    # 3. Save 512px Thumbnails
-    saved_thumb_paths = []
-    for thumb_file in thumbnails:
-        thumb_bytes = await thumb_file.read()
-        thumb_filename = thumb_file.filename
-        target_path = session_thumbnails_dir / thumb_filename
-        with open(target_path, "wb") as f:
-            f.write(thumb_bytes)
-        saved_thumb_paths.append(str(target_path))
+        # 3. Save 512px Thumbnails
+        saved_thumb_paths = []
+        for thumb_file in thumbnails:
+            thumb_bytes = await thumb_file.read()
+            thumb_filename = thumb_file.filename
+            target_path = session_thumbnails_dir / thumb_filename
+            with open(target_path, "wb") as f:
+                f.write(thumb_bytes)
+            saved_thumb_paths.append(str(target_path))
 
-    # 4. Save High-Res Originals
-    saved_orig_map = {}
-    for orig_file in originals:
-        orig_bytes = await orig_file.read()
-        orig_filename = orig_file.filename
-        target_orig_path = session_originals_dir / orig_filename
-        with open(target_orig_path, "wb") as f:
-            f.write(orig_bytes)
-        saved_orig_map[orig_filename] = str(target_orig_path)
+        # 4. Save High-Res Originals
+        saved_orig_map = {}
+        for orig_file in originals:
+            orig_bytes = await orig_file.read()
+            orig_filename = orig_file.filename
+            target_orig_path = session_originals_dir / orig_filename
+            with open(target_orig_path, "wb") as f:
+                f.write(orig_bytes)
+            saved_orig_map[orig_filename] = str(target_orig_path)
 
-    # 5. Run Phase 1 Filtering Engine on Thumbnails (Offloaded to CPU pool to keep event loop 100% responsive)
-    loop = asyncio.get_running_loop()
-    filter_result = await loop.run_in_executor(
-        CPU_WORKER_POOL,
-        filter_engine.run_phase1_filtering,
-        saved_thumb_paths
-    )
-
-    # Step 5b: Verify suspected QR on High-Res Original if available (handles client downsample compression loss)
-    for item in filter_result.get("survived_photos", []):
-        matching_orig_path = None
-        for orig_name, orig_path in saved_orig_map.items():
-            if any(k in orig_name for k in [item.get("photo_id", ""), item.get("filename", "")] if k):
-                matching_orig_path = orig_path
-                break
-        if matching_orig_path:
-            try:
-                import cv2
-                orig_bgr = cv2.imread(matching_orig_path)
-                if orig_bgr is not None and hasattr(cv2, "QRCodeDetector"):
-                    qr_det = cv2.QRCodeDetector()
-                    retval, decoded, _, _ = qr_det.detectAndDecodeMulti(orig_bgr)
-                    if retval and any(decoded):
-                        item["status"] = "REJECTED_JUNK"
-                        item["reject_reason"] = f"Junk QR Code in Original ({decoded[0][:25]}...)"
-            except Exception:
-                pass
-
-    # Segregate Survived vs Rejected Photos
-    survived_photos_list = [p for p in filter_result.get("all_scanned_photos", []) if p.get("status") == "PASSED"]
-    rejected_photos_list = [p for p in filter_result.get("all_scanned_photos", []) if p.get("status") != "PASSED"]
-
-    # 6. Populate PhotoMeta and PHOTO_STORE for survived photos only
-    survived_photos_meta: List[PhotoMeta] = []
-    for item in survived_photos_list:
-        p_id = None
-        for meta in metadata_list:
-            if meta.get("photo_id") and (meta.get("photo_id") in item.get("filename", "") or meta.get("filename") == item.get("filename")):
-                p_id = meta.get("photo_id")
-                break
-        if not p_id:
-            p_id = item.get("photo_id") or item.get("filename", "").replace("_thumb.jpg", "").replace("_thumb.png", "").replace("_thumb.webp", "")
-
-        meta = metadata_map.get(p_id, {})
-        orig_name = meta.get("filename", f"{p_id}.jpg")
-        thumb_filename = f"{p_id}_thumb.jpg"
-        orig_filename = f"{p_id}_orig_{orig_name}"
-        
-        web_thumb_url = f"/uploads/thumbnails/{session_id}/{thumb_filename}"
-        web_orig_url = f"/uploads/originals/{session_id}/{orig_filename}"
-        
-        photo_meta = PhotoMeta(
-            id=p_id,
-            filename=orig_name,
-            url=web_thumb_url,
-            preview_url=web_thumb_url,
-            original_url=web_orig_url,
-            thumbnail_url=web_thumb_url,
-            original_synced=True,
-            width=meta.get("original_width", 1200),
-            height=meta.get("original_height", 900),
-            aspect_ratio=item.get("aspect_ratio") or meta.get("aspect_ratio", 1.33),
-            dominant_colors=["#2C3E50", "#ECF0F1"]
+        # 5. Run Phase 1 Filtering Engine on Thumbnails (Offloaded to CPU pool to keep event loop 100% responsive)
+        loop = asyncio.get_running_loop()
+        filter_result = await loop.run_in_executor(
+            CPU_WORKER_POOL,
+            filter_engine.run_phase1_filtering,
+            saved_thumb_paths
         )
-        PHOTO_STORE[p_id] = photo_meta
-        SessionStore.save_photo(photo_meta, session_id=session_id)
-        survived_photos_meta.append(photo_meta)
 
-    # Attach web preview URLs to filter results
-    for p in filter_result.get("all_scanned_photos", []):
-        p_filename = p.get("filename", "")
-        p["web_url"] = f"/uploads/thumbnails/{session_id}/{p_filename}"
+        # Step 5b: Verify suspected QR on High-Res Original if available (handles client downsample compression loss)
+        for item in filter_result.get("survived_photos", []):
+            matching_orig_path = None
+            for orig_name, orig_path in saved_orig_map.items():
+                if any(k in orig_name for k in [item.get("photo_id", ""), item.get("filename", "")] if k):
+                    matching_orig_path = orig_path
+                    break
+            if matching_orig_path:
+                try:
+                    import cv2
+                    orig_bgr = cv2.imread(matching_orig_path)
+                    if orig_bgr is not None and hasattr(cv2, "QRCodeDetector"):
+                        qr_det = cv2.QRCodeDetector()
+                        retval, decoded, _, _ = qr_det.detectAndDecodeMulti(orig_bgr)
+                        if retval and any(decoded):
+                            item["status"] = "REJECTED_JUNK"
+                            item["reject_reason"] = f"Junk QR Code in Original ({decoded[0][:25]}...)"
+                except Exception:
+                    pass
 
-    elapsed_ms = (time.perf_counter() - start_time) * 1000
-    logger.info(f"[Phase 1 Gateway] Session {session_id}: Ingested {len(metadata_list)} photos, Survived: {len(survived_photos_meta)}, Rejected: {len(rejected_photos_list)} in {elapsed_ms:.2f}ms")
-    from app.metrics import MetricsCollector
-    MetricsCollector.record("Phase 1 Ingestion & Filtering", elapsed_ms, {
-        "photos_count": len(metadata_list),
-        "survived": len(survived_photos_meta),
-        "rejected": len(rejected_photos_list)
-    })
+        # Segregate Survived vs Rejected Photos
+        survived_photos_list = [p for p in filter_result.get("all_scanned_photos", []) if p.get("status") == "PASSED"]
+        rejected_photos_list = [p for p in filter_result.get("all_scanned_photos", []) if p.get("status") != "PASSED"]
 
-    # Update summary counts
-    summary = filter_result.get("summary", {})
-    summary["total_uploaded"] = len(metadata_list)
-    summary["total_survived"] = len(survived_photos_meta)
-    summary["total_rejected"] = len(rejected_photos_list)
+        # 6. Populate PhotoMeta and PHOTO_STORE for survived photos only
+        survived_photos_meta: List[PhotoMeta] = []
+        for item in survived_photos_list:
+            p_id = None
+            for meta in metadata_list:
+                if isinstance(meta, dict) and meta.get("photo_id") and (meta.get("photo_id") in item.get("filename", "") or meta.get("filename") == item.get("filename")):
+                    p_id = meta.get("photo_id")
+                    break
+            if not p_id:
+                p_id = item.get("photo_id") or item.get("filename", "").replace("_thumb.jpg", "").replace("_thumb.png", "").replace("_thumb.webp", "")
 
-    return {
-        "status": "success",
-        "session_id": session_id,
-        "summary": summary,
-        "total_ingested": len(metadata_list),
-        "total_survived": len(survived_photos_meta),
-        "total_rejected": len(rejected_photos_list),
-        "photos": survived_photos_meta,
-        "survived_photos": survived_photos_list,
-        "rejected_photos": rejected_photos_list,
-        "events": filter_result.get("events", []),
-        "layout_groups": filter_result.get("layout_groups", []),
-        "metadata": metadata_list
-    }
+            meta = metadata_map.get(p_id, {})
+            orig_name = meta.get("filename", f"{p_id}.jpg")
+            thumb_filename = f"{p_id}_thumb.jpg"
+            orig_filename = f"{p_id}_orig_{orig_name}"
+            
+            web_thumb_url = f"/uploads/thumbnails/{session_id}/{thumb_filename}"
+            web_orig_url = f"/uploads/originals/{session_id}/{orig_filename}"
+            
+            photo_meta = PhotoMeta(
+                id=str(p_id),
+                filename=str(orig_name),
+                url=web_thumb_url,
+                preview_url=web_thumb_url,
+                original_url=web_orig_url,
+                thumbnail_url=web_thumb_url,
+                original_synced=True,
+                width=int(meta.get("original_width") or 1200),
+                height=int(meta.get("original_height") or 900),
+                aspect_ratio=float(item.get("aspect_ratio") or meta.get("aspect_ratio") or 1.33),
+                dominant_colors=["#2C3E50", "#ECF0F1"]
+            )
+            PHOTO_STORE[p_id] = photo_meta
+            survived_photos_meta.append(photo_meta)
+
+        # Atomic Batch Persistence in SQLite (1000+ photos saved in a single transaction)
+        SessionStore.save_photos_batch(survived_photos_meta, session_id=session_id)
+
+        # Attach web preview URLs to filter results
+        for p in filter_result.get("all_scanned_photos", []):
+            p_filename = p.get("filename", "")
+            p["web_url"] = f"/uploads/thumbnails/{session_id}/{p_filename}"
+
+        # Explicit GC for large photo sets (avoids memory accumulation during peak 1000-photo uploads)
+        if len(metadata_list) > 100:
+            import gc
+            gc.collect()
+
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        logger.info(f"[Phase 1 Gateway] Session {session_id}: Ingested {len(metadata_list)} photos, Survived: {len(survived_photos_meta)}, Rejected: {len(rejected_photos_list)} in {elapsed_ms:.2f}ms")
+        from app.metrics import MetricsCollector
+        MetricsCollector.record("Phase 1 Ingestion & Filtering", elapsed_ms, {
+            "photos_count": len(metadata_list),
+            "survived": len(survived_photos_meta),
+            "rejected": len(rejected_photos_list)
+        })
+
+        # Update summary counts
+        summary = filter_result.get("summary", {})
+        summary["total_uploaded"] = len(metadata_list)
+        summary["total_survived"] = len(survived_photos_meta)
+        summary["total_rejected"] = len(rejected_photos_list)
+
+        return {
+            "status": "success",
+            "session_id": session_id,
+            "summary": summary,
+            "total_ingested": len(metadata_list),
+            "total_survived": len(survived_photos_meta),
+            "total_rejected": len(rejected_photos_list),
+            "photos": [p.dict() if hasattr(p, "dict") else p.model_dump() for p in survived_photos_meta],
+            "survived_photos": survived_photos_list,
+            "rejected_photos": rejected_photos_list,
+            "events": filter_result.get("events", []),
+            "layout_groups": filter_result.get("layout_groups", []),
+            "metadata": metadata_list
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"[Ingest Error] Unhandled exception during ingestion: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ingestion server error: {str(exc)}")
 
 @app.get("/api/templates")
 def get_all_templates():

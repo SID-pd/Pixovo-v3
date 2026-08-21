@@ -49,13 +49,17 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     except Exception:
         return 0.0
 
-def partition_macro_chapters(photos: List[Any], time_gap_threshold_sec: float = 2700.0, gps_distance_threshold_km: float = 5.0) -> List[Dict[str, Any]]:
+def partition_macro_chapters(
+    photos: List[Any],
+    time_gap_threshold_sec: float = 2700.0,
+    gps_distance_threshold_km: float = 5.0
+) -> List[Dict[str, Any]]:
     """
     Tier 1 (Macro-Clustering Engine):
     Partitions photos into cohesive narrative Story Chapters based on:
     - Time Gap Delta > 45 minutes (2700s)
     - GPS Haversine Distance > 5.0 km
-    - Missing EXIF Fallback: Dynamic index-based chunking (max 6-8 photos/chapter)
+    - Dynamic Capacity: Scales max photos per chapter (12 to 28) for up to 1,000 photos per session.
     """
     if not photos:
         return []
@@ -69,11 +73,20 @@ def partition_macro_chapters(photos: List[Any], time_gap_threshold_sec: float = 
         )
     )
 
+    total_count = len(sorted_photos)
+    # Dynamic chapter threshold: For <=50 photos: 12/ch; for 50-200: 16/ch; for 200+: 24/ch
+    if total_count > 200:
+        max_per_chapter = 24
+    elif total_count > 50:
+        max_per_chapter = 16
+    else:
+        max_per_chapter = 12
+
     chapters: List[Dict[str, Any]] = []
     current_chapter_photos = [sorted_photos[0]]
     ch_idx = 1
 
-    for i in range(1, len(sorted_photos)):
+    for i in range(1, total_count):
         prev = sorted_photos[i - 1]
         curr = sorted_photos[i]
 
@@ -88,8 +101,8 @@ def partition_macro_chapters(photos: List[Any], time_gap_threshold_sec: float = 
         time_gap = abs(t_curr - t_prev) if (t_curr > 0 and t_prev > 0) else 0.0
         gps_dist = haversine_km(lat_prev, lon_prev, lat_curr, lon_curr)
 
-        # Trigger new chapter if time gap > 45m OR GPS distance > 5km OR max photos per chapter reached (12 photos)
-        is_split = (time_gap > time_gap_threshold_sec) or (gps_dist > gps_distance_threshold_km) or (len(current_chapter_photos) >= 12)
+        # Trigger new chapter if time gap > 45m OR GPS distance > 5km OR max photos per chapter reached
+        is_split = (time_gap > time_gap_threshold_sec) or (gps_dist > gps_distance_threshold_km) or (len(current_chapter_photos) >= max_per_chapter)
 
         if is_split and current_chapter_photos:
             chapters.append({
@@ -192,13 +205,18 @@ def get_fallback_ai_response(user_prompt: str) -> Dict[str, Any]:
         ]
     }
 
+ENABLE_GEMINI_API = False  # Set to False to use ultra-fast local intelligent Story & Theme engine
+
 def generate_story_theme_batch(user_prompt: str, total_photos: int = 10) -> Dict[str, Any]:
-    """Calls Gemini API using google-genai or google-generativeai SDK with structured JSON output."""
+    """Calls Gemini API or uses fast intelligent local NLP theme & caption engine."""
     start_time = time.perf_counter()
 
-    if not GEMINI_API_KEY:
-        logger.info("[StoryAI] No GEMINI_API_KEY set in .env. Using offline intelligent fallback.")
-        return get_fallback_ai_response(user_prompt)
+    if not ENABLE_GEMINI_API or not GEMINI_API_KEY:
+        logger.info(f"[StoryAI] Local theme engine active (Gemini API disabled). Generating layout styles for: '{user_prompt}'")
+        res = get_fallback_ai_response(user_prompt)
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        logger.info(f"[StoryAI] Local Story & Theme batch generated in {elapsed_ms:.2f}ms | Category: '{res.get('primary_category')}' | Primary Theme: '{res.get('primary_theme')}'")
+        return res
 
     try:
         from google import genai

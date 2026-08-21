@@ -55,10 +55,16 @@ def generate_photobook_variations_engine(
         # Tier 2: Micro-Clustering (Shell & Core pHash Visual Similarity per Chapter)
         for ch in macro_chapters:
             ch_photos = ch.get("photos", [])
+            ch_title = ch.get("chapter_title", "")
             photo_chunks = cluster_photos_2tier_engine(ch_photos, chunk_size=2 if len(ch_photos) <= 4 else 3)
 
-            for chunk in photo_chunks:
-                caption = captions[(spread_idx - 1) % len(captions)]
+            for c_i, chunk in enumerate(photo_chunks):
+                # Spread caption: Chapter title on first spread of chapter, varied caption on subsequent spreads
+                if c_i == 0 and ch_title and len(macro_chapters) > 1:
+                    caption = ch_title.upper()
+                else:
+                    caption = captions[(spread_idx - 1) % len(captions)]
+
                 spread = build_dsa_spread_pair(
                     spread_idx=spread_idx,
                     photos=chunk,

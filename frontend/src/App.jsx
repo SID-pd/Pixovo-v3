@@ -158,8 +158,14 @@ export default function App() {
         // Launch background original HD streaming without blocking UI!
         streamOriginalsInBackground(origMap);
       } else {
-        const errData = await res.json();
-        alert(`Ingestion error: ${errData.detail || 'Failed to ingest photos'}`);
+        let errDetail = 'Failed to ingest photos';
+        try {
+          const errData = await res.json();
+          errDetail = errData.detail || errDetail;
+        } catch (_) {
+          errDetail = `Server returned status ${res.status} (${res.statusText})`;
+        }
+        alert(`Ingestion error: ${errDetail}`);
         setStep('upload');
       }
     } catch (e) {
@@ -169,10 +175,10 @@ export default function App() {
   };
 
   const handleGenerateVariationsAsync = async (promptOverride) => {
-    // UI Race Condition Guard: Wait up to 3 seconds for in-flight preview upload to complete if photos were uploaded!
+    // Wait for in-flight Phase 1 ingestion upload to complete if photos were selected
     let photosToUse = uploadedPhotos.length > 0 ? uploadedPhotos : uploadedPhotosRef.current;
     if (photosToUse.length === 0 && uploadedCount > 0) {
-      for (let i = 0; i < 15; i++) {
+      for (let i = 0; i < 40; i++) { // wait up to 8 seconds for ingestion
         if (uploadedPhotosRef.current.length > 0) {
           photosToUse = uploadedPhotosRef.current;
           break;
@@ -189,6 +195,7 @@ export default function App() {
 
     try {
       const photoIds = photosToUse.map(p => p.id);
+      console.log(`[Generate Async] Submitting ${photoIds.length} photo IDs for prompt: '${promptToUse}'`);
       const res = await fetch('/api/generate-async', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

@@ -22,6 +22,9 @@ eggs/
 backend/logs/
 backend/app/temp/
 backend/temp/
+backend/app/uploads/
+backend/app/exports/
+uploads/
 *.log
 
 # Node / Frontend

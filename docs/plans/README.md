@@ -12,6 +12,10 @@ Detailed, executable plans for each stage of [`ROADMAP.md`](../../ROADMAP.md).
 | Sessions | Isolated, no auth this milestone |
 | Storage | Local disk, behind a swappable interface |
 | Output | 3 genuinely distinct albums, real hero covers, print-ready PDF |
+## Architecture & Resilience Specifications
+
+* **Comprehensive Failsafes & Fallbacks:** [`FAILSAFE_AND_FALLBACK_SPEC.md`](../FAILSAFE_AND_FALLBACK_SPEC.md) — Detailed resilience and failure mitigation across client downsampling, network transport, filtering, AI themes, layout solving, storage, and print PDF compilation.
+* **Milestone 1 Completion Roadmap:** [`ROADMAP.md`](../../ROADMAP.md)
 
 ## Stage index
 

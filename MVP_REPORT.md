@@ -8,7 +8,7 @@
 
 Pixovo is an automated photobook design system. A user uploads a batch of raw photos, the system silently throws out the bad ones (blurry, duplicate, junk/document scans), groups the survivors into a coherent story, generates three distinct themed layout variations, lets the user preview and reshuffle them in an interactive UI, and finally exports a print-ready 300 DPI PDF with proper bleed margins.
 
-It's a two-service app: a **FastAPI/Python backend** (image processing, layout math, persistence) and a **plain React/Vite frontend** (upload UI, preview, export trigger), talking over a REST + Server-Sent-Events API on `localhost:8000` / `localhost:5173` in dev.
+It's a two-service app: a **FastAPI/Python backend** (image processing, layout math, persistence) and a **plain React/Vite frontend** (upload UI, preview, export trigger), talking over a REST API on `localhost:8000` / `localhost:5173` in dev.
 
 ---
 
@@ -16,11 +16,11 @@ It's a two-service app: a **FastAPI/Python backend** (image processing, layout m
 
 Walking through what happens when a real user drags in 150 photos:
 
-1. **Drop the photos.** [`PhotoUploader.jsx`](frontend/src/components/PhotoUploader.jsx) hands the file list to `PixovoClientDownsampler`, which now runs on a pool of Web Workers ([`downsample.worker.js`](frontend/src/utils/downsample.worker.js)) instead of the main thread — the tab stays responsive while 150 images get decoded and resized. Each photo is downscaled to a ≤512px JPEG thumbnail via `OffscreenCanvas`, and a client-side `photo_id` (`px_<random>_<timestamp>`) is minted for it. The original full-resolution file is kept in memory untouched, earmarked for later.
+1. **Drop the photos.** [`PhotoUploader.jsx`](frontend/src/components/PhotoUploader.jsx) hands the file list to `PixovoClientDownsampler`, which resizes every photo **on the main browser thread** using an `<img>` + `<canvas>` — despite `ARCHITECTURE.md`'s claim of "Web Workers," there is no worker in the actual code, so a large batch visibly freezes the tab while it downsamples. Each photo is downscaled to a ≤512px JPEG thumbnail, and a client-side `photo_id` (`px_<random>_<timestamp>`) is minted for it. The original full-resolution file is kept in memory untouched, earmarked for later.
 
 2. **UI advances immediately.** [`App.jsx`](frontend/src/App.jsx)'s `handlePhotosUploaded` doesn't wait for anything to finish uploading — it flips the screen to the theme-prompt step right away so the user can start typing while ingestion happens in the background.
 
-3. **Thumbnails + metadata go to the backend in chunks of 50.** Each chunk is POSTed to `/api/photobook/ingest` ([`main.py:160`](backend/app/main.py:160)). The very first chunk gets back a `session_id`, which is now persisted to `localStorage` and reused for every subsequent chunk *and* survives a page refresh mid-upload.
+3. **Thumbnails + metadata go to the backend in chunks of 50.** Each chunk is POSTed to `/api/photobook/ingest` ([`main.py:126`](backend/app/main.py:126)). The very first chunk gets back a `session_id`, which lives only in a plain JS variable (`lastSessionId`) inside `handlePhotosUploaded` — a page refresh mid-upload loses it, even though IndexedDB still has the queued HD originals waiting to sync.
 
 4. **The backend filters the batch.** `Phase1FilterEngine.run_phase1_filtering()` ([`filter_engine.py:1001`](backend/app/engine/filter/filter_engine.py:1001)) runs off the event loop in a CPU-sized thread pool and executes, per photo:
    - **Exposure guard** — rejects true blackout/whiteout frames while protecting artistic low-key/high-key shots.
@@ -34,9 +34,9 @@ Walking through what happens when a real user drags in 150 photos:
 
 6. **Original HD files stream up in the background,** three at a time, each one first cached in IndexedDB (so a dropped connection doesn't lose it) and removed only after the backend confirms receipt via `/api/upload-originals`.
 
-7. **User submits a theme prompt** ("Friends at ISKCON Temple", "Family Memories", etc.). `App.jsx` POSTs to `/api/generate-async`, gets a `202 Accepted` + `job_id` back immediately, and opens an `EventSource` against `/api/jobs/{job_id}/stream` — the backend now pushes progress updates as they happen instead of the client polling every 500ms.
+7. **User submits a theme prompt** ("Friends at ISKCON Temple", "Family Memories", etc.). `App.jsx` POSTs to `/api/generate-async`, gets a `202 Accepted` + `job_id` back immediately, and starts polling `GET /api/jobs/{job_id}` on a plain `setInterval` every **500ms** until the job completes or fails.
 
-8. **The backend does the actual "designing" in the background** (`process_async_job` → `_run_job`, [`main.py:561`](backend/app/main.py:561), gated by a CPU-sized `asyncio.Semaphore`):
+8. **The backend does the actual "designing" in the background** (`process_async_job`, [`main.py:706`](backend/app/main.py:706), gated by a hardcoded `asyncio.Semaphore(4)`):
    - `generate_story_theme_batch()` ([`story_ai.py`](backend/app/engine/story_ai.py)) picks a category, 3 distinct themes from a 20-theme palette matrix, and writes cover titles/captions. (Currently a fast local rules engine — see §4.)
    - `generate_photobook_variations_engine()` ([`solver.py`](backend/app/engine/solver.py)) partitions photos into macro chapters, clusters them 2-4 at a time into spread-sized chunks, and for each chunk calls `build_dsa_spread_pair()` ([`dsa_solver.py:394`](backend/app/engine/dsa_solver.py:394)) to compute exact `(x_pct, y_pct, w_pct, h_pct)` slot geometry — deciding which photo is "dominant," which layout family fits the photo count, and whether a caption needs a text slot.
    - Each slot also gets a pre-flight **effective DPI** badge (excellent/warning/alert) computed from the photo's native resolution vs. its physical slot size at 300 DPI, so print-quality problems surface before export, not after.
@@ -63,29 +63,35 @@ That's the whole loop — upload → filter → cluster → theme → lay out �
 | `build_dsa_spread_pair()` [(dsa_solver.py:394)](backend/app/engine/dsa_solver.py:394) | Computes exact percentage-based bounding boxes for every photo slot on a spread | This is the actual "layout designer" — it decides sizes/positions so photos of different aspect ratios tile a page with no gaps and no arbitrary cropping |
 | Pre-flight DPI check (inside `build_dsa_spread_pair`) | Flags any slot where the source photo doesn't have enough resolution for its printed size | Catches "this photo will look blurry in print" *before* the user pays for a PDF, not after |
 | `generate_print_pdf_engine()` [(pdf_exporter.py)](backend/app/engine/pdf_exporter.py) | Compiles the chosen variation into a vector 300 DPI PDF with bleed | The actual deliverable — everything upstream exists to produce this file correctly |
-| `_job_event_stream()` / SSE endpoint [(main.py)](backend/app/main.py) | Pushes job progress to the browser as it changes | Generation takes several seconds; the user needs live feedback, and server-push is cheaper than the client hammering a status endpoint every 500ms |
-| `BoundedCache` [(main.py)](backend/app/main.py) | Caps `PHOTO_STORE`/`JOBS_STORE` in-memory dict size with LRU eviction | Without this the process's memory grows for its entire uptime; SQLite is already the durable fallback, so evicting old entries is safe |
-| `sweep_expired_sessions()` [(cleanup.py)](backend/app/cleanup.py) | Deletes old session directories/DB rows/export PDFs on startup | Nothing previously deleted anything — disk usage and the DB would grow forever otherwise |
+| `pollJobStatus()` [(App.jsx)](frontend/src/App.jsx) | Fetches `/api/jobs/{id}` every 500ms until the job resolves | Generation takes several seconds and the client needs live progress; a fixed-interval poll is the simplest way to get it, at the cost of a steady stream of requests per active user |
+| `PHOTO_STORE` / `JOBS_STORE` [(main.py)](backend/app/main.py) | Plain in-memory dicts caching photos/jobs, backed by SQLite on miss | Fast-path reads without a DB round-trip for the common case; they currently have no eviction, so they grow for the life of the process |
 
 ---
 
 ## 4. Where Things Stand Right Now
 
-This section reflects the state **after** a recent hardening pass (dead-endpoint removal, SSE, worker-based downsampling, bounded caches, retention sweep, and initial test coverage — see git history for specifics).
+This is the state of the code on disk as of this report. A hardening pass (dead-endpoint removal, SSE push, worker-based downsampling, bounded caches, a retention sweep, and test coverage) was implemented and verified earlier in this session, but is **no longer present in the working tree** — the repo has reverted to its pre-hardening state (only `pixovo_session.db`'s contents differ from the last commit). Nothing here reflects that work; it's a plain read of what's actually in the files right now.
 
 **Solid:**
 - The filtering → clustering → layout pipeline is genuinely sophisticated and works end-to-end.
-- 1000-photo sessions are now handled correctly at the DB layer (batched writes, chunked reads).
-- Job status uses SSE push; client downsampling runs off the main thread; concurrency limits scale with the host machine instead of a hardcoded `4`.
-- A retention sweep now actually deletes expired session data instead of accumulating forever.
-- `backend/tests/` has real coverage (22 tests) of the SQLite batch layer, filter engine thresholds, and layout solver geometry — previously zero.
+- 1000-photo sessions are handled correctly at the DB layer: `SessionStore.save_photos_batch()` does one atomic `executemany` insert, and `get_photos()` chunks reads into groups of 500 to stay under SQLite's 999-parameter limit.
+- The DSA layout solver and DPI pre-flight check are the most mature, differentiated part of the codebase.
 
-**Still true, worth knowing:**
-- **No authentication.** `session_id` is the only access boundary, and it's guessable. Anyone with a session_id can read another session's `/uploads`.
-- **Gemini AI is present but off by default.** `generate_story_theme_batch()` currently always uses a fast local rules-based fallback (keyword matching against a 20-theme matrix), not a live LLM call — the toggle is now an explicit env var (`PIXOVO_ENABLE_GEMINI`) rather than a silent hardcoded flag, but the behavior hasn't changed. See §5, item 4.1.
-- **Single SQLite file, single machine.** Fine for the current scale; would need to move to Postgres to run multiple backend instances behind a load balancer.
-- **Local-dev/demo deployment only.** No Dockerfile, no CI, `run.py` now supports a non-reload multi-worker mode but there's still no process manager/orchestration around it.
-- **Documentation drift.** `ARCHITECTURE.md` still lists `EmotionThemeSelector.jsx` (removed as dead code) and doesn't yet reflect the SSE/worker/cleanup changes — worth a refresh pass.
+**Known gaps, as currently in the code:**
+- **No authentication.** `session_id` is the only access boundary, and it's a guessable 8-hex-char string. Anyone with (or guessing) a session_id can read another session's `/uploads` directly — the static mount has no access check.
+- **Two endpoints are broken.** `POST /api/curate-photos` and `POST /api/curate-and-generate` ([main.py:381](backend/app/main.py:381), [main.py:473](backend/app/main.py:473)) import `app.engine.selection.curation_pipeline.MasterCurationPipeline`, which doesn't exist anywhere in the repo — both 500 on every call. Unused by the frontend, but live in the API surface.
+- **Gemini AI is wired but hardcoded off.** `story_ai.py:208` sets `ENABLE_GEMINI_API = False` directly in code — `generate_story_theme_batch()` always uses the local rules-based fallback regardless of whether `GEMINI_API_KEY` is set.
+- **CORS allows `"*"`** alongside an explicit origin allowlist ([main.py:47-53](backend/app/main.py:47)) — the wildcard makes the allowlist redundant.
+- **Client downsampling runs on the main thread**, not a Web Worker as `ARCHITECTURE.md` claims — a large batch upload will visibly freeze the tab.
+- **Job status is 500ms polling**, not push — `App.jsx`'s `pollJobStatus` hits `/api/jobs/{id}` on a fixed interval.
+- **Concurrency limits are hardcoded** (`ThreadPoolExecutor(max_workers=4)`, `asyncio.Semaphore(4)`), independent of the host machine's actual CPU count.
+- **`PHOTO_STORE`/`JOBS_STORE` have no eviction** — they grow in memory for the life of the process.
+- **`EmotionThemeSelector.jsx` is unused dead code**, not imported anywhere.
+- **Nothing deletes old data.** No retention sweep exists — uploads, exports, and DB rows accumulate indefinitely.
+- **Zero test coverage.** `pytest` is a listed dependency; there are no test files anywhere in the repo.
+- **Real photo data is committed to git**: `backend/pixovo_session.db` (containing actual uploaded photo blob references) and `backend/venv/` (a full virtualenv) are both tracked.
+- **Single SQLite file, single machine, local-dev only.** No Dockerfile, no CI; `run.py` hardcodes `reload=True`, which is a dev-only flag being used as the de facto production entrypoint.
+- **Documentation drift.** `ARCHITECTURE.md` describes Web Workers and other behavior that doesn't match the current code — treat it as aspirational/historical rather than a literal spec.
 
 ---
 
@@ -118,7 +124,7 @@ Pulled from [`TODO.md`](TODO.md), organized by theme:
 ### 5.5 Production hardening
 - Migrate SQLite → PostgreSQL and add Redis, enabling a horizontally-scaled, multi-worker deployment (this is the point where the current SQLite-file architecture stops being enough).
 - Add IP-based rate limiting (`slowapi`) on upload/generation routes.
-- ~~Automated upload cleanup job~~ — **now implemented** as the startup retention sweep (`cleanup.py`); the team's original plan called for a 24-hour TTL specifically, current default is 14 days (`PIXOVO_RETENTION_DAYS`), worth revisiting once real usage patterns are known.
+- Automated upload cleanup job with a 24-hour retention TTL on temporary session files and exported PDFs — nothing currently deletes anything, so this is still fully open.
 
 Notably absent from the team's own TODO but worth flagging alongside it: **authentication/authorization** isn't mentioned anywhere in the roadmap, despite being the single biggest gap before this could safely serve real users with real photos. Worth raising with the team explicitly rather than assuming it's implied by "production hardening."
 
@@ -126,4 +132,4 @@ Notably absent from the team's own TODO but worth flagging alongside it: **authe
 
 ## 6. One-Paragraph Summary
 
-Pixovo today is a working local-dev MVP: drop in photos, get back a filtered, story-clustered, professionally laid-out, print-ready photobook PDF, entirely through automated computer vision and layout math — no live LLM call currently in the loop despite the plumbing being ready for one. The core pipeline (filter → cluster → theme → lay out → export) is the most mature part of the codebase and genuinely works at the 1000-photo scale it was built for. What's missing to go from "working demo" to "product real users can hit" is entirely in the surrounding infrastructure: authentication, cloud storage, a database that isn't a single file, and the security/ops hardening the team has already scoped out in their own TODO — none of which touches the actual photobook-design logic that makes this project interesting.
+Pixovo today is a working local-dev MVP: drop in photos, get back a filtered, story-clustered, professionally laid-out, print-ready photobook PDF, entirely through automated computer vision and layout math — no live LLM call currently in the loop despite the plumbing being ready for one. The core pipeline (filter → cluster → theme → lay out → export) is the most mature part of the codebase and genuinely works at the 1000-photo scale it was built for. Everything around that core is still in its original, unhardened state as of this report: no auth, two endpoints that 500 on every call, main-thread downsampling, fixed-interval polling instead of push, hardcoded concurrency limits, unbounded in-memory caches, no data retention, and zero test coverage. What's missing to go from "working demo" to "product real users can hit" is entirely in that surrounding infrastructure — none of it touches the actual photobook-design logic that makes this project interesting.

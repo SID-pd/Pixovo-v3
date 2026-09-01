@@ -144,24 +144,49 @@ export class PixovoClientDownsampler {
   }
 
   /**
-   * Package processed batch into FormData dual payload for Phase 1 backend ingestion.
-   * Payload 1: 512px Thumbnails + Metadata JSON (Fast selection)
-   * Payload 2: Original High-Res JPEGs (Mapped by photo_id)
+   * Split an array into fixed-size chunks.
+   * Static so callers can chunk without holding a downsampler instance.
    */
-  buildDualPayload(processedPhotos) {
+  static chunk(items, size = 40) {
+    const out = [];
+    for (let i = 0; i < items.length; i += size) {
+      out.push(items.slice(i, i + size));
+    }
+    return out;
+  }
+
+  /**
+   * Build ONE ingest chunk payload: 512px thumbnails + metadata JSON only.
+   *
+   * Full-resolution originals are deliberately NOT included. They stream
+   * separately via /api/upload-originals. The previous buildDualPayload()
+   * packed every thumbnail AND every original into a single FormData, which at
+   * 1,000 photos x ~8MB produced a ~8GB single POST that exhausted browser
+   * memory before reaching the network — and then uploaded those same originals
+   * a second time via the background sync.
+   *
+   * @param {Array<Object>} processedPhotos - one chunk's worth of processed photos
+   * @param {string} sessionId   - session token from POST /api/sessions
+   * @param {number} chunkIndex  - 0-based index of this chunk
+   * @param {number} chunkCount  - total number of chunks in this upload
+   * @returns {FormData}
+   */
+  buildChunkPayload(processedPhotos, sessionId, chunkIndex, chunkCount) {
     const formData = new FormData();
     const metadataArray = [];
 
     processedPhotos.forEach((photo) => {
-      // Append 512px thumbnail file
       if (photo.thumbnail_blob) {
         formData.append('thumbnails', photo.thumbnail_blob, `${photo.photo_id}_thumb.jpg`);
       }
 
-      // Append original file
-      formData.append('originals', photo.original_file, `${photo.photo_id}_orig_${photo.filename}`);
+      // Canvas downsampling strips EXIF, so the backend's own capture-time read
+      // on the thumbnail will usually miss. Carry the file's lastModified as a
+      // fallback so chronological chaptering has something real to sort on.
+      // (Consumed by Stage 1.2; true EXIF/GPS extraction lands in Stage 2.1.)
+      const tsMs = Date.parse(photo.timestamp);
+      const timestampEpoch = Number.isFinite(tsMs) ? Math.floor(tsMs / 1000) : 0;
 
-      // Metadata item
       metadataArray.push({
         photo_id: photo.photo_id,
         filename: photo.filename,
@@ -171,10 +196,14 @@ export class PixovoClientDownsampler {
         aspect_ratio: photo.aspect_ratio,
         orientation: photo.orientation,
         timestamp: photo.timestamp,
+        timestamp_epoch: timestampEpoch,
         thumbnail_size_bytes: photo.thumbnail_size_bytes
       });
     });
 
+    formData.append('session_id', sessionId);
+    formData.append('chunk_index', String(chunkIndex));
+    formData.append('chunk_count', String(chunkCount));
     formData.append('metadata_json', JSON.stringify(metadataArray));
     return formData;
   }

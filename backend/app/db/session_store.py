@@ -4,23 +4,75 @@ Provides thread-safe operations, automatic table creation, and crash-resilience.
 """
 
 import json
+import os
 import sqlite3
+import threading
 from pathlib import Path
 from typing import List, Optional, Dict, Any
-from app.schemas.photobook import PhotoMeta, JobStatusResponse, PhotobookVariation
+from app.schemas.photobook import (
+    PhotoMeta, JobStatusResponse, PhotobookVariation, GenerateVariationsResponse
+)
 from app.config import logger
 
-DB_PATH = Path(__file__).resolve().parent.parent.parent / "pixovo_session.db"
+# Overridable so tests can point at a throwaway file instead of the dev database.
+# Read at import time, which is when init_db() runs.
+DB_PATH = Path(
+    os.environ.get("PIXOVO_DB_PATH")
+    or Path(__file__).resolve().parent.parent.parent / "pixovo_session.db"
+)
+
+_local = threading.local()
+
+_PRAGMAS = (
+    "journal_mode=WAL",      # non-blocking concurrent reads
+    "synchronous=NORMAL",
+    "busy_timeout=30000",
+    "temp_store=MEMORY",
+)
+
 
 def get_db_connection() -> sqlite3.Connection:
+    """
+    Returns this thread's SQLite connection, creating it on first use.
+
+    Stage 1.4: previously every call opened a fresh connection and executed four
+    PRAGMAs. At the load target that is thousands of connection setups per
+    second across the worker pool, and `journal_mode=WAL` in particular is not
+    free. One connection per thread is both correct (SQLite connections are not
+    safe to share across threads) and far cheaper.
+
+    Callers must NOT close the returned connection — it is reused. `with conn:`
+    is still correct: it manages the transaction, not the connection.
+    """
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        # Reading total_changes is a C-level attribute access (effectively free)
+        # that raises if the connection has been closed. Without this probe, a
+        # single stray close() anywhere poisons every later call on this thread
+        # with "Cannot operate on a closed database" far from the real cause.
+        try:
+            conn.total_changes
+            return conn
+        except sqlite3.ProgrammingError:
+            logger.warning("[DB] Thread-local connection was closed; reopening.")
+            _local.conn = None
+
     conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=30.0)
-    # Enable WAL mode for high-concurrency non-blocking reads & writes
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA busy_timeout=30000;")
-    conn.execute("PRAGMA temp_store=MEMORY;")
+    for pragma in _PRAGMAS:
+        conn.execute(f"PRAGMA {pragma};")
     conn.row_factory = sqlite3.Row
+    _local.conn = conn
     return conn
+
+
+def close_thread_connection() -> None:
+    """Closes this thread's connection, if any. Used by tests and shutdown."""
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        finally:
+            _local.conn = None
 
 def init_db():
     """Initializes the database schema if it doesn't already exist."""
@@ -46,7 +98,16 @@ def init_db():
                 shell_phash TEXT,
                 core_phash TEXT,
                 is_hero_candidate INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                -- Stage 1.2: the filter engine's output, previously discarded
+                timestamp_epoch REAL DEFAULT 0,
+                latitude REAL,
+                longitude REAL,
+                hero_score REAL DEFAULT 0,
+                layout_role TEXT DEFAULT 'STANDARD_FRAME',
+                is_event_cover_hero INTEGER DEFAULT 0,
+                tenengrad_score REAL,
+                contrast_score REAL
             )
         """)
         conn.execute("""
@@ -62,54 +123,307 @@ def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Stage 1.1: Explicit session lifecycle. A session is created BEFORE any
+        # upload begins, so every ingest chunk lands under one stable session_id.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expected_photo_count INTEGER DEFAULT 0,
+                received_photo_count INTEGER DEFAULT 0,
+                survived_photo_count INTEGER DEFAULT 0,
+                total_bytes INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'ingesting'
+            )
+        """)
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_photos_session ON photos(session_id)
         """)
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs(session_id)
         """)
-    conn.close()
+        _ensure_photo_columns(conn)
+    # NOTE: no conn.close() — the connection is thread-local and reused.
     logger.info(f"[DB] Initialized persistent SQLite database at: {DB_PATH}")
+
+
+# Columns added after the original `photos` table shipped. CREATE TABLE IF NOT
+# EXISTS will not add columns to a table that already exists, so an existing
+# database needs an explicit, idempotent ALTER.
+_PHOTO_COLUMN_MIGRATIONS = [
+    ("timestamp_epoch", "REAL DEFAULT 0"),
+    ("latitude", "REAL"),
+    ("longitude", "REAL"),
+    ("hero_score", "REAL DEFAULT 0"),
+    ("layout_role", "TEXT DEFAULT 'STANDARD_FRAME'"),
+    ("is_event_cover_hero", "INTEGER DEFAULT 0"),
+    ("tenengrad_score", "REAL"),
+    ("contrast_score", "REAL"),
+]
+
+
+def _ensure_photo_columns(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(photos)")}
+    added = []
+    for column, ddl in _PHOTO_COLUMN_MIGRATIONS:
+        if column not in existing:
+            conn.execute(f"ALTER TABLE photos ADD COLUMN {column} {ddl}")
+            added.append(column)
+    if added:
+        logger.info(f"[DB] Migrated photos table: added {', '.join(added)}")
+
+
+def _row_to_photo_meta(row: sqlite3.Row) -> PhotoMeta:
+    """
+    Single source of truth for row -> PhotoMeta.
+
+    get_photo(), get_photos() and get_session_photos() each hand-built this
+    object from ~20 identical lines. Adding the Stage 1.2 fields would have made
+    that ~28 lines in three places, and the classic failure is updating two of
+    the three — leaving photos correct via one endpoint and null via another.
+    """
+    keys = row.keys()
+
+    def opt(name, default=None):
+        """Tolerate rows read from a database that predates a column."""
+        return row[name] if name in keys else default
+
+    return PhotoMeta(
+        id=row["id"],
+        filename=row["filename"],
+        url=row["url"],
+        preview_url=row["preview_url"],
+        original_url=row["original_url"],
+        thumbnail_url=row["thumbnail_url"],
+        original_synced=bool(row["original_synced"]),
+        width=row["width"],
+        height=row["height"],
+        aspect_ratio=row["aspect_ratio"],
+        dominant_colors=json.loads(row["dominant_colors_json"] or "[]"),
+        score=row["score"],
+        blur_score=row["blur_score"],
+        face_count=row["face_count"],
+        shell_phash=row["shell_phash"],
+        core_phash=row["core_phash"],
+        is_hero_candidate=bool(row["is_hero_candidate"]),
+        # Stage 1.2 fields
+        timestamp_epoch=opt("timestamp_epoch", 0.0) or 0.0,
+        latitude=opt("latitude"),
+        longitude=opt("longitude"),
+        hero_score=opt("hero_score", 0.0) or 0.0,
+        layout_role=opt("layout_role", "STANDARD_FRAME") or "STANDARD_FRAME",
+        is_event_cover_hero=bool(opt("is_event_cover_hero", 0)),
+        tenengrad_score=opt("tenengrad_score"),
+        contrast_score=opt("contrast_score"),
+    )
+
+
+# Column list shared by save_photo() and save_photos_batch() so the two INSERTs
+# cannot drift apart.
+_PHOTO_INSERT_COLUMNS = (
+    "id, session_id, filename, url, preview_url, original_url, thumbnail_url, "
+    "original_synced, width, height, aspect_ratio, dominant_colors_json, "
+    "score, blur_score, face_count, shell_phash, core_phash, is_hero_candidate, "
+    "timestamp_epoch, latitude, longitude, hero_score, layout_role, "
+    "is_event_cover_hero, tenengrad_score, contrast_score"
+)
+_PHOTO_INSERT_PLACEHOLDERS = ", ".join(["?"] * len(_PHOTO_INSERT_COLUMNS.split(",")))
+
+
+def _photo_to_row(photo: PhotoMeta, session_id: Optional[str]) -> tuple:
+    """Flattens a PhotoMeta into the tuple order declared by _PHOTO_INSERT_COLUMNS."""
+    return (
+        photo.id,
+        session_id,
+        photo.filename,
+        photo.url,
+        photo.preview_url or photo.url,
+        photo.original_url,
+        photo.thumbnail_url,
+        1 if photo.original_synced else 0,
+        photo.width,
+        photo.height,
+        photo.aspect_ratio,
+        json.dumps(photo.dominant_colors or []),
+        photo.score,
+        photo.blur_score,
+        photo.face_count,
+        photo.shell_phash,
+        photo.core_phash,
+        1 if photo.is_hero_candidate else 0,
+        photo.timestamp_epoch or 0.0,
+        photo.latitude,
+        photo.longitude,
+        photo.hero_score or 0.0,
+        photo.layout_role or "STANDARD_FRAME",
+        1 if photo.is_event_cover_hero else 0,
+        photo.tenengrad_score,
+        photo.contrast_score,
+    )
+
 
 # Initialize on module import
 init_db()
 
 class SessionStore:
-    """Thread-safe CRUD operations for Photos and Jobs."""
+    """Thread-safe CRUD operations for Sessions, Photos and Jobs."""
+
+    @staticmethod
+    def ping() -> bool:
+        """Cheapest possible liveness check on the database, for /ready."""
+        conn = get_db_connection()
+        conn.execute("SELECT 1").fetchone()
+        return True
+
+    # ------------------------------------------------------------------
+    # Sessions (Stage 1.1)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def create_session(session_id: str, expected_photo_count: int = 0) -> None:
+        """Registers a new upload session before any ingest chunk arrives."""
+        conn = get_db_connection()
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO sessions (session_id, expected_photo_count, status)
+                VALUES (?, ?, 'ingesting')
+                """,
+                (session_id, expected_photo_count),
+            )
+
+    @staticmethod
+    def get_session(session_id: str) -> Optional[Dict[str, Any]]:
+        if not session_id:
+            return None
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    @staticmethod
+    def touch_session(session_id: str) -> None:
+        """Bumps last_accessed_at so the retention sweep can identify live sessions."""
+        conn = get_db_connection()
+        with conn:
+            conn.execute(
+                "UPDATE sessions SET last_accessed_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+                (session_id,),
+            )
+
+    @staticmethod
+    def set_session_status(session_id: str, status: str) -> None:
+        conn = get_db_connection()
+        with conn:
+            conn.execute(
+                "UPDATE sessions SET status = ?, last_accessed_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+                (status, session_id),
+            )
+
+    @staticmethod
+    def recount_session(session_id: str, received_delta: int = 0) -> Dict[str, int]:
+        """
+        Recomputes session counters from the photos table rather than incrementing
+        a running total. A replayed ingest chunk therefore converges instead of
+        inflating the counts (chunk idempotency, Stage 1.1 Task 6).
+
+        `received_delta` is added to the stored received count, which cannot be
+        derived from `photos` because rejected photos are never persisted there.
+        """
+        conn = get_db_connection()
+        with conn:
+            if received_delta:
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET received_photo_count = received_photo_count + ?
+                    WHERE session_id = ?
+                    """,
+                    (received_delta, session_id),
+                )
+            conn.execute(
+                """
+                UPDATE sessions
+                SET survived_photo_count = (
+                        SELECT COUNT(*) FROM photos WHERE session_id = ?
+                    ),
+                    last_accessed_at = CURRENT_TIMESTAMP
+                WHERE session_id = ?
+                """,
+                (session_id, session_id),
+            )
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT received_photo_count, survived_photo_count FROM sessions WHERE session_id = ?",
+            (session_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {"received_photo_count": 0, "survived_photo_count": 0}
+        return {
+            "received_photo_count": row["received_photo_count"],
+            "survived_photo_count": row["survived_photo_count"],
+        }
+
+    @staticmethod
+    def add_session_bytes(session_id: str, delta: int) -> int:
+        """
+        Adds to a session's running byte total and returns the new value.
+
+        Stage 1.3: a running counter, not a filesystem walk. StorageBackend
+        .total_bytes() rglobs the tree, which is far too slow to call on every
+        upload at 20 concurrent sessions.
+        """
+        if not delta:
+            return int((SessionStore.get_session(session_id) or {}).get("total_bytes") or 0)
+        conn = get_db_connection()
+        with conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET total_bytes = COALESCE(total_bytes, 0) + ?,
+                    last_accessed_at = CURRENT_TIMESTAMP
+                WHERE session_id = ?
+                """,
+                (int(delta), session_id),
+            )
+        cur = conn.cursor()
+        cur.execute("SELECT total_bytes FROM sessions WHERE session_id = ?", (session_id,))
+        row = cur.fetchone()
+        return int(row["total_bytes"]) if row else 0
+
+    @staticmethod
+    def total_bytes_all_sessions() -> int:
+        """Sum of every session's running byte total — for the global watermark."""
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COALESCE(SUM(total_bytes), 0) AS total FROM sessions")
+        return int(cur.fetchone()["total"])
+
+    @staticmethod
+    def get_photo_session(photo_id: str) -> Optional[str]:
+        """Returns the session_id owning a photo, for cross-session access checks."""
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT session_id FROM photos WHERE id = ?", (photo_id,))
+        row = cur.fetchone()
+        return row["session_id"] if row else None
+
+    # ------------------------------------------------------------------
+    # Photos
+    # ------------------------------------------------------------------
 
     @staticmethod
     def save_photo(photo: PhotoMeta, session_id: Optional[str] = None) -> None:
         conn = get_db_connection()
-        try:
-            with conn:
-                conn.execute("""
-                    INSERT OR REPLACE INTO photos (
-                        id, session_id, filename, url, preview_url, original_url, thumbnail_url,
-                        original_synced, width, height, aspect_ratio, dominant_colors_json,
-                        score, blur_score, face_count, shell_phash, core_phash, is_hero_candidate
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    photo.id,
-                    session_id,
-                    photo.filename,
-                    photo.url,
-                    photo.preview_url or photo.url,
-                    photo.original_url,
-                    photo.thumbnail_url,
-                    1 if photo.original_synced else 0,
-                    photo.width,
-                    photo.height,
-                    photo.aspect_ratio,
-                    json.dumps(photo.dominant_colors or []),
-                    photo.score,
-                    photo.blur_score,
-                    photo.face_count,
-                    photo.shell_phash,
-                    photo.core_phash,
-                    1 if photo.is_hero_candidate else 0
-                ))
-        finally:
-            conn.close()
+        with conn:
+            conn.execute(
+                f"INSERT OR REPLACE INTO photos ({_PHOTO_INSERT_COLUMNS}) "
+                f"VALUES ({_PHOTO_INSERT_PLACEHOLDERS})",
+                _photo_to_row(photo, session_id),
+            )
 
     @staticmethod
     def save_photos_batch(photos: List[PhotoMeta], session_id: Optional[str] = None) -> None:
@@ -117,71 +431,21 @@ class SessionStore:
         if not photos:
             return
         conn = get_db_connection()
-        try:
-            records = [
-                (
-                    photo.id,
-                    session_id,
-                    photo.filename,
-                    photo.url,
-                    photo.preview_url or photo.url,
-                    photo.original_url,
-                    photo.thumbnail_url,
-                    1 if photo.original_synced else 0,
-                    photo.width,
-                    photo.height,
-                    photo.aspect_ratio,
-                    json.dumps(photo.dominant_colors or []),
-                    photo.score,
-                    photo.blur_score,
-                    photo.face_count,
-                    photo.shell_phash,
-                    photo.core_phash,
-                    1 if photo.is_hero_candidate else 0
-                )
-                for photo in photos
-            ]
-            with conn:
-                conn.executemany("""
-                    INSERT OR REPLACE INTO photos (
-                        id, session_id, filename, url, preview_url, original_url, thumbnail_url,
-                        original_synced, width, height, aspect_ratio, dominant_colors_json,
-                        score, blur_score, face_count, shell_phash, core_phash, is_hero_candidate
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, records)
-        finally:
-            conn.close()
+        records = [_photo_to_row(photo, session_id) for photo in photos]
+        with conn:
+            conn.executemany(
+                f"INSERT OR REPLACE INTO photos ({_PHOTO_INSERT_COLUMNS}) "
+                f"VALUES ({_PHOTO_INSERT_PLACEHOLDERS})",
+                records,
+            )
 
     @staticmethod
     def get_photo(photo_id: str) -> Optional[PhotoMeta]:
         conn = get_db_connection()
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT * FROM photos WHERE id = ?", (photo_id,))
-            row = cur.fetchone()
-            if not row:
-                return None
-            return PhotoMeta(
-                id=row["id"],
-                filename=row["filename"],
-                url=row["url"],
-                preview_url=row["preview_url"],
-                original_url=row["original_url"],
-                thumbnail_url=row["thumbnail_url"],
-                original_synced=bool(row["original_synced"]),
-                width=row["width"],
-                height=row["height"],
-                aspect_ratio=row["aspect_ratio"],
-                dominant_colors=json.loads(row["dominant_colors_json"] or "[]"),
-                score=row["score"],
-                blur_score=row["blur_score"],
-                face_count=row["face_count"],
-                shell_phash=row["shell_phash"],
-                core_phash=row["core_phash"],
-                is_hero_candidate=bool(row["is_hero_candidate"])
-            )
-        finally:
-            conn.close()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM photos WHERE id = ?", (photo_id,))
+        row = cur.fetchone()
+        return _row_to_photo_meta(row) if row else None
 
     @staticmethod
     def get_photos(photo_ids: List[str]) -> List[PhotoMeta]:
@@ -192,38 +456,16 @@ class SessionStore:
         if not photo_ids:
             return []
         conn = get_db_connection()
-        try:
-            results = {}
-            chunk_size = 500
-            cur = conn.cursor()
-            for i in range(0, len(photo_ids), chunk_size):
-                chunk = photo_ids[i:i + chunk_size]
-                placeholders = ",".join(["?"] * len(chunk))
-                cur.execute(f"SELECT * FROM photos WHERE id IN ({placeholders})", chunk)
-                rows = cur.fetchall()
-                for row in rows:
-                    results[row["id"]] = PhotoMeta(
-                        id=row["id"],
-                        filename=row["filename"],
-                        url=row["url"],
-                        preview_url=row["preview_url"],
-                        original_url=row["original_url"],
-                        thumbnail_url=row["thumbnail_url"],
-                        original_synced=bool(row["original_synced"]),
-                        width=row["width"],
-                        height=row["height"],
-                        aspect_ratio=row["aspect_ratio"],
-                        dominant_colors=json.loads(row["dominant_colors_json"] or "[]"),
-                        score=row["score"],
-                        blur_score=row["blur_score"],
-                        face_count=row["face_count"],
-                        shell_phash=row["shell_phash"],
-                        core_phash=row["core_phash"],
-                        is_hero_candidate=bool(row["is_hero_candidate"])
-                    )
-            return [results[pid] for pid in photo_ids if pid in results]
-        finally:
-            conn.close()
+        results = {}
+        chunk_size = 500
+        cur = conn.cursor()
+        for i in range(0, len(photo_ids), chunk_size):
+            chunk = photo_ids[i:i + chunk_size]
+            placeholders = ",".join(["?"] * len(chunk))
+            cur.execute(f"SELECT * FROM photos WHERE id IN ({placeholders})", chunk)
+            for row in cur.fetchall():
+                results[row["id"]] = _row_to_photo_meta(row)
+        return [results[pid] for pid in photo_ids if pid in results]
 
     @staticmethod
     def get_session_photos(session_id: str) -> List[PhotoMeta]:
@@ -231,120 +473,93 @@ class SessionStore:
         if not session_id:
             return []
         conn = get_db_connection()
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT * FROM photos WHERE session_id = ? ORDER BY created_at ASC", (session_id,))
-            rows = cur.fetchall()
-            return [
-                PhotoMeta(
-                    id=row["id"],
-                    filename=row["filename"],
-                    url=row["url"],
-                    preview_url=row["preview_url"],
-                    original_url=row["original_url"],
-                    thumbnail_url=row["thumbnail_url"],
-                    original_synced=bool(row["original_synced"]),
-                    width=row["width"],
-                    height=row["height"],
-                    aspect_ratio=row["aspect_ratio"],
-                    dominant_colors=json.loads(row["dominant_colors_json"] or "[]"),
-                    score=row["score"],
-                    blur_score=row["blur_score"],
-                    face_count=row["face_count"],
-                    shell_phash=row["shell_phash"],
-                    core_phash=row["core_phash"],
-                    is_hero_candidate=bool(row["is_hero_candidate"])
-                )
-                for row in rows
-            ]
-        finally:
-            conn.close()
+        cur = conn.cursor()
+        # Ordered by capture time so downstream chaptering receives a
+        # chronological list. created_at is insertion order, which after
+        # chunked ingest is upload order, not photo order.
+        cur.execute(
+            """
+            SELECT * FROM photos
+            WHERE session_id = ?
+            ORDER BY
+                CASE WHEN COALESCE(timestamp_epoch, 0) > 0 THEN 0 ELSE 1 END,
+                timestamp_epoch ASC,
+                created_at ASC
+            """,
+            (session_id,),
+        )
+        return [_row_to_photo_meta(row) for row in cur.fetchall()]
 
     @staticmethod
     def mark_original_synced(photo_id: str, original_url: str) -> None:
         conn = get_db_connection()
-        try:
-            with conn:
-                conn.execute("""
-                    UPDATE photos 
-                    SET original_url = ?, original_synced = 1 
-                    WHERE id = ?
-                """, (original_url, photo_id))
-        finally:
-            conn.close()
+        with conn:
+            conn.execute("""
+                UPDATE photos 
+                SET original_url = ?, original_synced = 1 
+                WHERE id = ?
+            """, (original_url, photo_id))
 
     @staticmethod
     def count_photos() -> int:
         conn = get_db_connection()
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) as count FROM photos")
-            return cur.fetchone()["count"]
-        finally:
-            conn.close()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) as count FROM photos")
+        return cur.fetchone()["count"]
 
     @staticmethod
     def save_job(job: JobStatusResponse, session_id: Optional[str] = None) -> None:
         conn = get_db_connection()
-        try:
-            result_json = None
-            if job.result and job.result.variations:
-                result_json = json.dumps({
-                    "theme_name": job.result.theme_name,
-                    "variations": [v.dict() for v in job.result.variations]
-                })
-            with conn:
-                conn.execute("""
-                    INSERT OR REPLACE INTO jobs (
-                        job_id, session_id, status, progress, message, variations_json, error_message, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                """, (
-                    job.job_id,
-                    session_id,
-                    job.status,
-                    job.progress,
-                    job.message,
-                    result_json,
-                    getattr(job, "error", None)
-                ))
-        finally:
-            conn.close()
+        result_json = None
+        if job.result and job.result.variations:
+            result_json = json.dumps({
+                "theme_name": job.result.theme_name,
+                "variations": [v.dict() for v in job.result.variations]
+            })
+        with conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO jobs (
+                    job_id, session_id, status, progress, message, variations_json, error_message, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (
+                job.job_id,
+                session_id,
+                job.status,
+                job.progress,
+                job.message,
+                result_json,
+                getattr(job, "error", None)
+            ))
 
     @staticmethod
     def get_job(job_id: str) -> Optional[JobStatusResponse]:
         conn = get_db_connection()
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,))
-            row = cur.fetchone()
-            if not row:
-                return None
-            
-            result_obj = None
-            if row["variations_json"]:
-                raw_data = json.loads(row["variations_json"])
-                variations = [PhotobookVariation(**v) for v in raw_data.get("variations", [])]
-                result_obj = GenerateVariationsResponse(
-                    theme_name=raw_data.get("theme_name", "Devotional / Temple"),
-                    variations=variations
-                )
-            
-            return JobStatusResponse(
-                job_id=row["job_id"],
-                status=row["status"],
-                progress=row["progress"],
-                message=row["message"],
-                result=result_obj
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        
+        result_obj = None
+        if row["variations_json"]:
+            raw_data = json.loads(row["variations_json"])
+            variations = [PhotobookVariation(**v) for v in raw_data.get("variations", [])]
+            result_obj = GenerateVariationsResponse(
+                theme_name=raw_data.get("theme_name", "Devotional / Temple"),
+                variations=variations
             )
-        finally:
-            conn.close()
+        
+        return JobStatusResponse(
+            job_id=row["job_id"],
+            status=row["status"],
+            progress=row["progress"],
+            message=row["message"],
+            result=result_obj
+        )
 
     @staticmethod
     def count_jobs() -> int:
         conn = get_db_connection()
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) as count FROM jobs")
-            return cur.fetchone()["count"]
-        finally:
-            conn.close()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) as count FROM jobs")
+        return cur.fetchone()["count"]

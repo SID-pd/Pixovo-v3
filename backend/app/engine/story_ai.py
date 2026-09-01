@@ -85,6 +85,11 @@ def partition_macro_chapters(
     chapters: List[Dict[str, Any]] = []
     current_chapter_photos = [sorted_photos[0]]
     ch_idx = 1
+    # Stage 1.2 diagnostics: which rule actually drove each split. Before
+    # timestamp_epoch existed on PhotoMeta, every photo read 0, so time and GPS
+    # rules could never fire and chapters were purely `cap` splits — fixed-size
+    # chunks of upload order wearing the name "story chapters".
+    split_reasons = {"time": 0, "gps": 0, "cap": 0}
 
     for i in range(1, total_count):
         prev = sorted_photos[i - 1]
@@ -102,7 +107,17 @@ def partition_macro_chapters(
         gps_dist = haversine_km(lat_prev, lon_prev, lat_curr, lon_curr)
 
         # Trigger new chapter if time gap > 45m OR GPS distance > 5km OR max photos per chapter reached
-        is_split = (time_gap > time_gap_threshold_sec) or (gps_dist > gps_distance_threshold_km) or (len(current_chapter_photos) >= max_per_chapter)
+        split_on_time = time_gap > time_gap_threshold_sec
+        split_on_gps = gps_dist > gps_distance_threshold_km
+        split_on_cap = len(current_chapter_photos) >= max_per_chapter
+        is_split = split_on_time or split_on_gps or split_on_cap
+
+        if split_on_time:
+            split_reasons["time"] += 1
+        elif split_on_gps:
+            split_reasons["gps"] += 1
+        elif split_on_cap:
+            split_reasons["cap"] += 1
 
         if is_split and current_chapter_photos:
             chapters.append({
@@ -122,7 +137,20 @@ def partition_macro_chapters(
             "photos": current_chapter_photos
         })
 
-    logger.info(f"[Tier 1 Macro Clustering] Partitioned {len(photos)} photos into {len(chapters)} Story Chapters.")
+    dated = sum(
+        1 for p in sorted_photos
+        if (getattr(p, "timestamp_epoch", 0) or (p.get("timestamp_epoch", 0) if isinstance(p, dict) else 0)) > 0
+    )
+    logger.info(
+        f"[Tier 1 Macro Clustering] Partitioned {len(photos)} photos into {len(chapters)} Story Chapters "
+        f"| splits: time={split_reasons['time']} gps={split_reasons['gps']} cap={split_reasons['cap']} "
+        f"| photos with capture time: {dated}/{total_count}"
+    )
+    if dated == 0 and total_count > 1:
+        logger.warning(
+            "[Tier 1 Macro Clustering] No photo has a capture time — chapters are fixed-size "
+            "chunks of upload order, not story chapters."
+        )
     return chapters
 
 def get_fallback_ai_response(user_prompt: str) -> Dict[str, Any]:

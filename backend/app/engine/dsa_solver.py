@@ -323,6 +323,19 @@ def cluster_photos_2tier_engine(photos: List[PhotoMeta], chunk_size: int = 3) ->
     if not photos:
         return []
 
+    # Stage 1.2 guard: this engine is driven entirely by shell/core pHash. When
+    # those are empty, compute_phash_distance() returns its 99 no-data sentinel
+    # for every pair, no similarity match ever fires, and spreads silently
+    # degrade to array order. Surface that instead of failing quietly.
+    usable_phash = sum(1 for p in photos if p.shell_phash and p.core_phash)
+    if usable_phash == 0:
+        logger.warning(
+            f"[Cluster] 0/{len(photos)} photos have usable pHashes — "
+            f"spread grouping is falling back to array order."
+        )
+    elif usable_phash < len(photos):
+        logger.info(f"[Cluster] {usable_phash}/{len(photos)} photos have usable pHashes")
+
     n = len(photos)
     if n <= chunk_size:
         return [photos]

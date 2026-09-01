@@ -62,15 +62,16 @@ export default function PhotoUploader({ onPhotosUploaded, isUploading }) {
       setProcessingStage('ready');
       setIsProcessing(false);
 
-      // 3. Build Dual-Payload for API Ingestion Handshake
-      const dualPayloadFormData = downsampler.buildDualPayload(processedResults);
-
-      // 4. Pass dual payload & preview references to parent App.jsx
+      // 3. Hand the processed photos to App.jsx, which opens a session and
+      //    uploads them in chunks. The payload is no longer built here: a
+      //    single FormData containing every original was a ~8GB request at
+      //    1,000 photos. App.jsx now calls downsampler.buildChunkPayload()
+      //    once per chunk.
       onPhotosUploaded({
         processedCount: processedResults.length,
         processedPhotos: processedResults,
         previewItems: previewItems,
-        formData: dualPayloadFormData,
+        downsampler: downsampler,
         downsampleTimeMs: totalDownsampleTimeMs
       });
 

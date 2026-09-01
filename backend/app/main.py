@@ -5,10 +5,12 @@ asyncio.Semaphore(4) concurrency control, 2MB file limit, Pillow Decompression B
 and Aspect Ratio clamping (0.33 to 3.0).
 """
 
+import os
 import uuid
 import time
 import asyncio
 import shutil
+import secrets
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -22,21 +24,38 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.config import (
-    UPLOADS_DIR, UPLOADS_ORIGINALS_DIR, UPLOADS_PREVIEWS_DIR, UPLOADS_THUMBNAILS_DIR, EXPORTS_DIR, logger
+    UPLOADS_DIR, UPLOADS_ORIGINALS_DIR, UPLOADS_PREVIEWS_DIR, UPLOADS_THUMBNAILS_DIR, EXPORTS_DIR, logger,
+    MAX_PHOTOS_PER_SESSION, INGEST_CHUNK_SIZE,
+    STORAGE, storage_key, MAX_BYTES_PER_SESSION, GLOBAL_DISK_WATERMARK,
+    FILTER_WORKERS, JOB_CONCURRENCY, POOL_KIND,
+    PHOTO_CACHE_SIZE, JOB_CACHE_SIZE, CACHE_TTL_SECONDS
 )
 from app.schemas.photobook import (
     PhotoMeta, GenerateVariationsRequest, GenerateVariationsResponse, JobStatusResponse, SpreadPair, PhotobookVariation
 )
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from cachetools import TTLCache
 from app.db.session_store import SessionStore
 from app.engine.color_extractor import extract_dominant_colors
 from app.engine.story_ai import generate_story_theme_batch
 from app.engine.solver import generate_photobook_variations_engine
 from app.engine.pdf_exporter import generate_print_pdf_engine
-from app.engine.filter.filter_engine import Phase1FilterEngine
+from app.engine.filter.filter_engine import (
+    Phase1FilterEngine, scan_photo, finalise_scanned_batch
+)
 
 filter_engine = Phase1FilterEngine()
-CPU_WORKER_POOL = ThreadPoolExecutor(max_workers=4)
+
+# Stage 1.4: one pool, sized from the host, replacing a hardcoded 4 that also
+# had filter_engine constructing its own inner pool of 4 per call.
+# POOL_KIND is settled by measurement in Stage 1.7 — OpenCV releases the GIL,
+# PIL and imagehash largely do not.
+CPU_WORKER_POOL = (
+    ProcessPoolExecutor(max_workers=FILTER_WORKERS)
+    if POOL_KIND == "process"
+    else ThreadPoolExecutor(max_workers=FILTER_WORKERS, thread_name_prefix="pixovo-cpu")
+)
 
 app = FastAPI(
     title="Pixovo Template Engine (PTE)",
@@ -64,11 +83,47 @@ app.add_middleware(
 app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 app.mount("/exports", StaticFiles(directory=str(EXPORTS_DIR)), name="exports")
 
-# Thread-safe persistent SQLite storage + fast in-memory working cache
-PHOTO_STORE: Dict[str, PhotoMeta] = {}
-JOBS_STORE: Dict[str, JobStatusResponse] = {}
-CONCURRENCY_SEMAPHORE = asyncio.Semaphore(4)
+# Bounded in-memory working caches over the SQLite source of truth.
+#
+# Stage 1.4: these were plain dicts with no eviction, so they grew for the life
+# of the process — at the load target that is 20,000 PhotoMeta objects held
+# forever. TTLCache bounds both size and age; every read path already falls back
+# to SessionStore on a miss, so eviction is correct and merely slower.
+#
+# TTLCache is NOT thread-safe and these are touched from pool threads, so all
+# access goes through _CACHE_LOCK via the helpers below.
+_CACHE_LOCK = threading.Lock()
+PHOTO_STORE: TTLCache = TTLCache(maxsize=PHOTO_CACHE_SIZE, ttl=CACHE_TTL_SECONDS)
+JOBS_STORE: TTLCache = TTLCache(maxsize=JOB_CACHE_SIZE, ttl=CACHE_TTL_SECONDS)
+
+CONCURRENCY_SEMAPHORE = asyncio.Semaphore(JOB_CONCURRENCY)
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB limit per file for High-Res original photos
+
+
+def cache_photo(photo: PhotoMeta) -> None:
+    with _CACHE_LOCK:
+        PHOTO_STORE[photo.id] = photo
+
+
+def cache_photos(photos: List[PhotoMeta]) -> None:
+    with _CACHE_LOCK:
+        for photo in photos:
+            PHOTO_STORE[photo.id] = photo
+
+
+def get_cached_photo(photo_id: str) -> Optional[PhotoMeta]:
+    with _CACHE_LOCK:
+        return PHOTO_STORE.get(photo_id)
+
+
+def cache_job(job: JobStatusResponse) -> None:
+    with _CACHE_LOCK:
+        JOBS_STORE[job.job_id] = job
+
+
+def get_cached_job(job_id: str) -> Optional[JobStatusResponse]:
+    with _CACHE_LOCK:
+        return JOBS_STORE.get(job_id)
 
 @app.on_event("startup")
 async def startup_event():
@@ -79,13 +134,39 @@ async def startup_event():
     logger.info(f"[PTE Backend] Persisted Photos: {SessionStore.count_photos()} | Persisted Jobs: {SessionStore.count_jobs()}")
     logger.info("=" * 60)
 
+@app.get("/health")
+async def health():
+    """
+    Liveness probe. Deliberately does no I/O — this is the endpoint the load
+    test measures p99 against, so it must reflect event-loop responsiveness and
+    nothing else.
+    """
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+async def ready():
+    """Readiness probe: is the database actually reachable?"""
+    try:
+        SessionStore.ping()
+        return {"status": "ready"}
+    except Exception as e:
+        logger.error(f"[Ready] Database unavailable: {e}")
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {e}")
+
+
 @app.get("/")
 def read_root():
+    """
+    Service info. Note this runs two COUNT(*) queries, so it is NOT a liveness
+    probe — use /health for that.
+    """
     return {
         "status": "online",
         "service": "Pixovo Template Engine (PTE) High-Scale Backend",
-        "concurrency_limit": 4,
-        "max_upload_size_mb": 20,
+        "concurrency_limit": JOB_CONCURRENCY,
+        "filter_workers": FILTER_WORKERS,
+        "max_upload_size_mb": MAX_FILE_SIZE // (1024 * 1024),
         "active_jobs": SessionStore.count_jobs(),
         "cached_photos": SessionStore.count_photos()
     }
@@ -115,33 +196,115 @@ def get_system_stats():
             "persisted_photos": SessionStore.count_photos(),
             "persisted_jobs": SessionStore.count_jobs(),
             "in_memory_cached_photos": len(PHOTO_STORE),
-            "in_memory_active_jobs": len(JOBS_STORE)
+            "in_memory_active_jobs": len(JOBS_STORE),
+            "photo_cache_max": PHOTO_CACHE_SIZE,
+            "filter_workers": FILTER_WORKERS,
+            "job_concurrency": JOB_CONCURRENCY,
+            "pool_kind": POOL_KIND
         },
         "performance": summary
     }
 
+class CreateSessionRequest(BaseModel):
+    expected_photo_count: int = 0
+
+
+@app.post("/api/sessions", status_code=status.HTTP_201_CREATED)
+async def create_session(req: CreateSessionRequest):
+    """
+    Opens an upload session BEFORE any photo bytes are sent.
+
+    Stage 1.1: previously `session_id` was minted inside the ingest handler, so
+    every chunk of a chunked upload produced its own orphaned session. The client
+    now calls this once and carries the returned token through every chunk.
+    """
+    if req.expected_photo_count > MAX_PHOTOS_PER_SESSION:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Maximum {MAX_PHOTOS_PER_SESSION} photos per session (requested {req.expected_photo_count})."
+        )
+
+    # Stage 1.3: refuse new sessions once the machine is near its disk ceiling.
+    # Telling a user "at capacity" up front is far better than accepting their
+    # upload and dying halfway through it with a full disk.
+    used = SessionStore.total_bytes_all_sessions()
+    if used >= GLOBAL_DISK_WATERMARK:
+        logger.error(
+            f"[Session] Refusing new session — storage at {used / 1024**3:.1f} GB "
+            f"of {GLOBAL_DISK_WATERMARK / 1024**3:.0f} GB watermark"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Server is at storage capacity. Please try again later."
+        )
+
+    session_id = f"sess_{secrets.token_urlsafe(24)}"
+    SessionStore.create_session(session_id, req.expected_photo_count)
+    logger.info(
+        f"[Session] Created {session_id} expecting {req.expected_photo_count} photos "
+        f"(chunk size {INGEST_CHUNK_SIZE})"
+    )
+    return {
+        "session_id": session_id,
+        "max_photos": MAX_PHOTOS_PER_SESSION,
+        "chunk_size": INGEST_CHUNK_SIZE,
+    }
+
+
+@app.get("/api/sessions/{session_id}")
+async def get_session(session_id: str):
+    """
+    Rehydrates a session after a page refresh. Returns session counters and the
+    photos persisted so far so the client can resume without re-uploading.
+    """
+    session = SessionStore.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Unknown session.")
+    if session.get("status") == "expired":
+        raise HTTPException(status_code=410, detail="Session has expired.")
+
+    SessionStore.touch_session(session_id)
+    photos = SessionStore.get_session_photos(session_id)
+    return {
+        "session_id": session_id,
+        "status": session.get("status"),
+        "expected_photo_count": session.get("expected_photo_count"),
+        "received_photo_count": session.get("received_photo_count"),
+        "survived_photo_count": session.get("survived_photo_count"),
+        "photos": [p.model_dump() for p in photos],
+    }
+
+
 @app.post("/api/photobook/ingest")
 async def ingest_photobook_dual_payload(
+    session_id: str = Form(...),
+    chunk_index: int = Form(default=0),
+    chunk_count: int = Form(default=1),
     thumbnails: Optional[List[UploadFile]] = File(default=[]),
-    originals: Optional[List[UploadFile]] = File(default=[]),
     metadata_json: Optional[str] = Form(default="[]")
 ):
     """
-    Phase 1 Ingestion Gateway Endpoint:
-    Receives Client Dual-Payload:
-    - 512px WebP/JPEG thumbnails (for AI filtering & UI previews)
-    - Full High-Res original files (for 300 DPI PDF print compilation)
-    - Structured EXIF metadata JSON (photo_id, aspect_ratio, timestamp, GPS)
+    Phase 1 Ingestion Gateway — one chunk of a chunked upload.
+
+    Receives 512px thumbnails + structured metadata JSON only. Full-resolution
+    originals are NOT accepted here; they stream separately via
+    /api/upload-originals so a 1,000-photo session is never one 8 GB request.
     """
     import json
     start_time = time.perf_counter()
-    session_id = f"sess_{uuid.uuid4().hex[:8]}"
+
+    session = SessionStore.get_session(session_id)
+    if not session:
+        logger.warning(f"[Ingest Error] Unknown session_id: {session_id}")
+        raise HTTPException(status_code=404, detail="Unknown or expired session.")
+    if session.get("status") == "expired":
+        raise HTTPException(status_code=410, detail="Session has expired.")
+    SessionStore.touch_session(session_id)
 
     thumbnails = thumbnails or []
-    originals = originals or []
 
-    if not thumbnails and not originals and (not metadata_json or metadata_json == "[]"):
-        logger.warning("[Ingest Error] Ingestion called with empty payload.")
+    if not thumbnails and (not metadata_json or metadata_json == "[]"):
+        logger.warning(f"[Ingest Error] Empty payload for session {session_id} chunk {chunk_index}.")
         raise HTTPException(status_code=400, detail="No photos or metadata received in ingestion payload.")
 
     try:
@@ -152,103 +315,210 @@ async def ingest_photobook_dual_payload(
             logger.error(f"[Ingest Error] Malformed metadata JSON: {e}")
             raise HTTPException(status_code=400, detail=f"Invalid metadata JSON: {str(e)}")
 
-        # 2. Setup Session-Specific Storage Directories
-        session_originals_dir = UPLOADS_ORIGINALS_DIR / session_id
-        session_thumbnails_dir = UPLOADS_THUMBNAILS_DIR / session_id
-        session_originals_dir.mkdir(parents=True, exist_ok=True)
-        session_thumbnails_dir.mkdir(parents=True, exist_ok=True)
-
         metadata_map = {m["photo_id"]: m for m in metadata_list if isinstance(m, dict) and "photo_id" in m}
 
-        # 3. Save 512px Thumbnails
+        # 2. Save 512px thumbnails through the storage backend.
+        #
+        #    Stage 1.3: writes go through STORAGE rather than touching
+        #    UPLOADS_THUMBNAILS_DIR, and stream in 1 MB chunks instead of
+        #    `await thumb_file.read()` loading each file whole.
+        #
+        #    Stage 1.2: each thumbnail's mtime is stamped with the client-reported
+        #    capture time of the ORIGINAL file. Canvas downsampling strips EXIF,
+        #    so filter_engine.extract_5_signal_metadata() falls back to the file's
+        #    mtime — which for a temp file written moments ago is "now" for every
+        #    photo. That made every capture time identical and silently disabled
+        #    both the filter engine's internal event clustering and the 45-minute
+        #    chapter rule.
         saved_thumb_paths = []
         for thumb_file in thumbnails:
-            thumb_bytes = await thumb_file.read()
-            thumb_filename = thumb_file.filename
-            target_path = session_thumbnails_dir / thumb_filename
-            with open(target_path, "wb") as f:
-                f.write(thumb_bytes)
-            saved_thumb_paths.append(str(target_path))
+            thumb_filename = Path(thumb_file.filename or "").name
+            if not thumb_filename:
+                logger.warning(f"[Ingest] Skipping thumbnail with no filename in session {session_id}")
+                continue
 
-        # 4. Save High-Res Originals
-        saved_orig_map = {}
-        for orig_file in originals:
-            orig_bytes = await orig_file.read()
-            orig_filename = orig_file.filename
-            target_orig_path = session_originals_dir / orig_filename
-            with open(target_orig_path, "wb") as f:
-                f.write(orig_bytes)
-            saved_orig_map[orig_filename] = str(target_orig_path)
+            key = storage_key("thumbnails", session_id, thumb_filename)
+            STORAGE.put_stream(key, thumb_file.file)
+            target_path = STORAGE.get_path(key)
+            if not target_path:
+                logger.error(f"[Ingest] Thumbnail vanished after write: {key}")
+                continue
 
-        # 5. Run Phase 1 Filtering Engine on Thumbnails (Offloaded to CPU pool to keep event loop 100% responsive)
+            stem = Path(thumb_filename).stem
+            client_pid = stem[: -len("_thumb")] if stem.endswith("_thumb") else stem
+            client_ts = (metadata_map.get(client_pid) or {}).get("timestamp_epoch")
+            if client_ts:
+                try:
+                    os.utime(target_path, (float(client_ts), float(client_ts)))
+                except (OSError, ValueError, TypeError) as e:
+                    logger.debug(f"[Ingest] Could not set mtime for {thumb_filename}: {e}")
+
+            saved_thumb_paths.append(target_path)
+
+        # 3. Phase 1 filtering.
+        #
+        #    Stage 1.4: fanned out PER PHOTO onto the single shared pool, rather
+        #    than handing the whole batch to run_phase1_filtering — which used to
+        #    construct its own inner ThreadPoolExecutor(4) on top of this one.
+        #    Nested pools meant FILTER_WORKERS x 4 threads (plus OpenCV's own
+        #    per-op fan-out) contending for far fewer cores. Fanning out here
+        #    parallelises across concurrent sessions instead of within one.
+        #
+        #    Stage 1.1 note: the previous "step 5b" re-ran cv2.imread() over every
+        #    full-resolution original here to re-check for QR codes — synchronously,
+        #    on the event loop. It is gone along with the originals payload.
         loop = asyncio.get_running_loop()
+        # Module-level `scan_photo` rather than the bound method: a
+        # ProcessPoolExecutor pickles the callable, and a bound method drags the
+        # engine's mediapipe/ONNX handles along with it (unpicklable ctypes
+        # pointers). See filter_engine's worker entry points.
+        scan_futures = [
+            loop.run_in_executor(
+                CPU_WORKER_POOL, scan_photo, path, f"p_{idx + 1}"
+            )
+            for idx, path in enumerate(saved_thumb_paths)
+        ]
+        scanned_photos = await asyncio.gather(*scan_futures)
+
+        # The cross-photo half (solo-anchor safeguard, burst dedupe, DBSCAN event
+        # clustering, hero ranking) is serial and cheap — no decoding, no I/O.
         filter_result = await loop.run_in_executor(
             CPU_WORKER_POOL,
-            filter_engine.run_phase1_filtering,
-            saved_thumb_paths
+            finalise_scanned_batch,
+            list(scanned_photos),
+            len(saved_thumb_paths),
         )
-
-        # Step 5b: Verify suspected QR on High-Res Original if available (handles client downsample compression loss)
-        for item in filter_result.get("survived_photos", []):
-            matching_orig_path = None
-            for orig_name, orig_path in saved_orig_map.items():
-                if any(k in orig_name for k in [item.get("photo_id", ""), item.get("filename", "")] if k):
-                    matching_orig_path = orig_path
-                    break
-            if matching_orig_path:
-                try:
-                    import cv2
-                    orig_bgr = cv2.imread(matching_orig_path)
-                    if orig_bgr is not None and hasattr(cv2, "QRCodeDetector"):
-                        qr_det = cv2.QRCodeDetector()
-                        retval, decoded, _, _ = qr_det.detectAndDecodeMulti(orig_bgr)
-                        if retval and any(decoded):
-                            item["status"] = "REJECTED_JUNK"
-                            item["reject_reason"] = f"Junk QR Code in Original ({decoded[0][:25]}...)"
-                except Exception:
-                    pass
 
         # Segregate Survived vs Rejected Photos
         survived_photos_list = [p for p in filter_result.get("all_scanned_photos", []) if p.get("status") == "PASSED"]
         rejected_photos_list = [p for p in filter_result.get("all_scanned_photos", []) if p.get("status") != "PASSED"]
 
-        # 6. Populate PhotoMeta and PHOTO_STORE for survived photos only
+        # 4. Populate PhotoMeta and PHOTO_STORE for survived photos only.
+        #
+        #    Stage 1.1: the client-minted photo_id is now the single join key.
+        #    Thumbnails arrive named "{photo_id}_thumb.jpg", so the ID is parsed
+        #    straight back out of the filename and looked up in metadata_map —
+        #    replacing a linear scan of metadata_list per photo plus a chain of
+        #    filename-suffix stripping fallbacks.
         survived_photos_meta: List[PhotoMeta] = []
-        for item in survived_photos_list:
-            p_id = None
-            for meta in metadata_list:
-                if isinstance(meta, dict) and meta.get("photo_id") and (meta.get("photo_id") in item.get("filename", "") or meta.get("filename") == item.get("filename")):
-                    p_id = meta.get("photo_id")
-                    break
-            if not p_id:
-                p_id = item.get("photo_id") or item.get("filename", "").replace("_thumb.jpg", "").replace("_thumb.png", "").replace("_thumb.webp", "")
+        unmatched: List[str] = []
+        exif_time_hits = 0
 
-            meta = metadata_map.get(p_id, {})
+        for item in survived_photos_list:
+            thumb_name = item.get("filename", "")
+            p_id = Path(thumb_name).stem
+            if p_id.endswith("_thumb"):
+                p_id = p_id[: -len("_thumb")]
+
+            meta = metadata_map.get(p_id)
+            if not meta:
+                unmatched.append(thumb_name)
+                continue
+
             orig_name = meta.get("filename", f"{p_id}.jpg")
-            thumb_filename = f"{p_id}_thumb.jpg"
-            orig_filename = f"{p_id}_orig_{orig_name}"
-            
-            web_thumb_url = f"/uploads/thumbnails/{session_id}/{thumb_filename}"
-            web_orig_url = f"/uploads/originals/{session_id}/{orig_filename}"
-            
+            web_thumb_url = STORAGE.url_for(
+                storage_key("thumbnails", session_id, f"{p_id}_thumb.jpg")
+            )
+
+            # Capture-time precedence (Stage 1.2).
+            #
+            # `taken_at` is only trustworthy when the filter engine derived it
+            # from the image itself. Its `mtime` / `current_time` fallbacks read
+            # the thumbnail's filesystem timestamp, which we control and which
+            # would otherwise be meaningless. So:
+            #   1. real EXIF (or a date parsed from the filename)
+            #   2. client-reported lastModified of the original file
+            #   3. taken_at from mtime — correct now, because step 3 of this
+            #      handler stamped it with the client timestamp
+            #   4. unknown (0) -> chaptering degrades to upload order
+            TRUSTED_DATE_SOURCES = ("exif_datetime", "filename_regex")
+            if item.get("date_source") in TRUSTED_DATE_SOURCES and item.get("taken_at"):
+                timestamp_epoch = float(item["taken_at"])
+                exif_time_hits += 1
+            else:
+                timestamp_epoch = (
+                    float(meta.get("timestamp_epoch") or 0)
+                    or float(item.get("taken_at") or 0)
+                    or 0.0
+                )
+
             photo_meta = PhotoMeta(
                 id=str(p_id),
                 filename=str(orig_name),
                 url=web_thumb_url,
                 preview_url=web_thumb_url,
-                original_url=web_orig_url,
+                # The original has NOT arrived yet — it streams separately via
+                # /api/upload-originals, which sets original_url and flips the
+                # synced flag. Claiming original_synced=True here is what caused
+                # mark_original_synced() to silently overwrite a URL that had
+                # already been reported as synced.
+                original_url=None,
                 thumbnail_url=web_thumb_url,
-                original_synced=True,
-                width=int(meta.get("original_width") or 1200),
-                height=int(meta.get("original_height") or 900),
+                original_synced=False,
+                width=int(meta.get("original_width") or item.get("width") or 1200),
+                height=int(meta.get("original_height") or item.get("height") or 900),
                 aspect_ratio=float(item.get("aspect_ratio") or meta.get("aspect_ratio") or 1.33),
-                dominant_colors=["#2C3E50", "#ECF0F1"]
+
+                # ----- Stage 1.2: carry the filter engine's output forward -----
+                # Without these, cluster_photos_2tier_engine, partition_macro_chapters
+                # and cover selection all run on null inputs.
+                timestamp_epoch=timestamp_epoch,
+                latitude=item.get("latitude"),
+                longitude=item.get("longitude"),
+                hero_score=float(item.get("hero_score") or 0.0),
+                layout_role=item.get("layout_role") or "STANDARD_FRAME",
+                is_event_cover_hero=bool(item.get("is_event_cover_hero", False)),
+                is_hero_candidate=bool(item.get("is_event_cover_hero", False)),
+                # `score` is kept as a normalised 0-1 mirror of hero_score for any
+                # legacy consumer; hero_score is what the solver should read.
+                score=round(float(item.get("hero_score") or 0.0) / 100.0, 4),
+                blur_score=item.get("blur_score"),
+                tenengrad_score=item.get("tenengrad_score"),
+                contrast_score=item.get("contrast_score"),
+                face_count=int(item.get("face_count") or 0),
+                shell_phash=item.get("shell_phash") or "",
+                core_phash=item.get("core_phash") or "",
+                dominant_colors=item.get("dominant_colors") or ["#2C3E50", "#ECF0F1", "#7F8C8D"],
             )
-            PHOTO_STORE[p_id] = photo_meta
+            cache_photo(photo_meta)
             survived_photos_meta.append(photo_meta)
 
-        # Atomic Batch Persistence in SQLite (1000+ photos saved in a single transaction)
+        if unmatched:
+            logger.warning(
+                f"[Ingest] Session {session_id} chunk {chunk_index}: "
+                f"{len(unmatched)} thumbnails had no matching metadata entry "
+                f"(first few: {unmatched[:3]})"
+            )
+
+        # Stage 1.2 data-contract diagnostics. These assert the boundary is
+        # actually carrying signal rather than defaults — if pHash coverage or
+        # hero_score max reads zero, clustering and cover selection are silently
+        # back to running on nulls.
+        if survived_photos_meta:
+            phash_ok = sum(1 for p in survived_photos_meta if p.shell_phash and p.core_phash)
+            max_hero = max(p.hero_score or 0.0 for p in survived_photos_meta)
+            distinct_palettes = len({tuple(p.dominant_colors) for p in survived_photos_meta})
+            logger.info(
+                f"[Ingest] Data contract | pHash {phash_ok}/{len(survived_photos_meta)} "
+                f"| hero_score max {max_hero:.1f} "
+                f"| capture-time EXIF {exif_time_hits}/{len(survived_photos_meta)} "
+                f"| distinct palettes {distinct_palettes}"
+            )
+            if phash_ok == 0:
+                logger.error("[Ingest] pHash coverage is ZERO — spread clustering will fall back to array order.")
+            if max_hero == 0.0:
+                logger.error("[Ingest] All hero_scores are ZERO — cover selection cannot rank photos.")
+
+        # Atomic Batch Persistence in SQLite. INSERT OR REPLACE keyed on the
+        # client-minted photo_id makes a replayed chunk converge rather than
+        # duplicate, which is what allows the client to retry safely.
         SessionStore.save_photos_batch(survived_photos_meta, session_id=session_id)
+
+        # Session counters are recomputed from the photos table rather than
+        # incremented, so a retried chunk does not inflate them.
+        session_totals = SessionStore.recount_session(
+            session_id, received_delta=len(metadata_list)
+        )
 
         # Attach web preview URLs to filter results
         for p in filter_result.get("all_scanned_photos", []):
@@ -260,13 +530,25 @@ async def ingest_photobook_dual_payload(
             import gc
             gc.collect()
 
+        is_final_chunk = (chunk_index + 1) >= chunk_count
+        if is_final_chunk:
+            SessionStore.set_session_status(session_id, "ready")
+
         elapsed_ms = (time.perf_counter() - start_time) * 1000
-        logger.info(f"[Phase 1 Gateway] Session {session_id}: Ingested {len(metadata_list)} photos, Survived: {len(survived_photos_meta)}, Rejected: {len(rejected_photos_list)} in {elapsed_ms:.2f}ms")
+        logger.info(
+            f"[Phase 1 Gateway] Session {session_id} chunk {chunk_index + 1}/{chunk_count}: "
+            f"received {len(metadata_list)}, survived {len(survived_photos_meta)}, "
+            f"rejected {len(rejected_photos_list)} in {elapsed_ms:.2f}ms "
+            f"| session totals: {session_totals['survived_photo_count']}/"
+            f"{session_totals['received_photo_count']}"
+        )
         from app.metrics import MetricsCollector
         MetricsCollector.record("Phase 1 Ingestion & Filtering", elapsed_ms, {
             "photos_count": len(metadata_list),
             "survived": len(survived_photos_meta),
-            "rejected": len(rejected_photos_list)
+            "rejected": len(rejected_photos_list),
+            "chunk_index": chunk_index,
+            "chunk_count": chunk_count
         })
 
         # Update summary counts
@@ -278,11 +560,19 @@ async def ingest_photobook_dual_payload(
         return {
             "status": "success",
             "session_id": session_id,
+            "chunk_index": chunk_index,
+            "chunk_count": chunk_count,
+            "is_final_chunk": is_final_chunk,
             "summary": summary,
+            # Per-chunk counts
             "total_ingested": len(metadata_list),
             "total_survived": len(survived_photos_meta),
             "total_rejected": len(rejected_photos_list),
-            "photos": [p.dict() if hasattr(p, "dict") else p.model_dump() for p in survived_photos_meta],
+            # Cumulative session counts, so the client can show overall progress
+            # without summing chunk responses itself.
+            "session_received": session_totals["received_photo_count"],
+            "session_survived": session_totals["survived_photo_count"],
+            "photos": [p.model_dump() for p in survived_photos_meta],
             "survived_photos": survived_photos_list,
             "rejected_photos": rejected_photos_list,
             "events": filter_result.get("events", []),
@@ -330,6 +620,10 @@ class SingleSpreadReshuffleRequest(BaseModel):
 class VariationsReshuffleRequest(BaseModel):
     job_id: str
     seed_offset: int = 1
+    # Stage 1.6: required so reshuffle reloads THIS session's photos. It used to
+    # read the whole process-wide photo cache, which at 20 concurrent users
+    # meant reshuffling could pull another user's photos into your book.
+    session_id: Optional[str] = None
 
 @app.post("/api/spreads/reshuffle", response_model=SpreadPair)
 def reshuffle_single_spread(req: SingleSpreadReshuffleRequest):
@@ -349,18 +643,33 @@ def reshuffle_single_spread(req: SingleSpreadReshuffleRequest):
 def reshuffle_job_variations(req: VariationsReshuffleRequest):
     """Reshuffles themes & palettes across the 3 saved persistent variations."""
     t0 = time.perf_counter()
-    if req.job_id not in JOBS_STORE:
+    job = get_cached_job(req.job_id) or SessionStore.get_job(req.job_id)
+    if job is None:
         raise HTTPException(status_code=404, detail="Job ID not found")
-        
-    job = JOBS_STORE[req.job_id]
     if not job.result:
         raise HTTPException(status_code=400, detail="Job result not ready")
 
     from app.engine.solver import generate_photobook_variations_engine
-    # Retrieve photos and ai batch result
-    sample_photos = list(PHOTO_STORE.values()) if PHOTO_STORE else [
-        PhotoMeta(id="p1", url="/uploads/sample_placeholder.jpg", aspect_ratio=1.33, dominant_colors=["#FAF9F6"])
-    ]
+
+    # Stage 1.6: load THIS session's photos.
+    #
+    # This used to be `list(PHOTO_STORE.values())` — the entire process-wide
+    # cache — falling back to a single `sample_placeholder.jpg`. Two bugs in one
+    # line: a cross-session data leak (another user's photos could land in your
+    # reshuffled book) and a placeholder book when the cache was cold.
+    if not req.session_id:
+        raise HTTPException(
+            status_code=400,
+            detail="session_id is required to reshuffle variations."
+        )
+
+    photos = SessionStore.get_session_photos(req.session_id)
+    if not photos:
+        raise HTTPException(
+            status_code=409,
+            detail="No photos found for this session. Cannot reshuffle."
+        )
+
     ai_batch_result = {
         "variations": [
             {"variation_id": f"var_{i+1}", "variation_title": v.variation_title, "theme_name": v.theme_name, "cover_title": v.cover_title, "cover_subtitle": v.cover_subtitle}
@@ -368,8 +677,11 @@ def reshuffle_job_variations(req: VariationsReshuffleRequest):
         ]
     }
 
-    new_variations = generate_photobook_variations_engine(sample_photos, ai_batch_result, variant_seed_offset=req.seed_offset)
+    new_variations = generate_photobook_variations_engine(photos, ai_batch_result, variant_seed_offset=req.seed_offset)
     job.result.variations = new_variations
+    # Persist, so a reshuffle survives a cache eviction or restart.
+    cache_job(job)
+    SessionStore.save_job(job, session_id=req.session_id)
     elapsed_ms = (time.perf_counter() - t0) * 1000
     from app.metrics import MetricsCollector
     MetricsCollector.record("Variations Reshuffle", elapsed_ms, {
@@ -651,134 +963,240 @@ async def upload_photos(files: List[UploadFile] = File(...)):
 
 @app.post("/api/upload-originals")
 async def upload_originals(
+    session_id: str,
     photo_id: str,
     file: UploadFile = File(...)
 ):
     """
     Phase 2 (Background HD Sync):
-    Receives 20MB original print files in background parallel stream.
-    Saves original untouched file to /uploads/originals/ and updates PhotoMeta in PHOTO_STORE.
+    Receives one full-resolution original in the background stream and writes it
+    to the session's originals directory.
+
+    Stage 1.1 changes:
+    - `session_id` is required and verified against the photo's owning session,
+      so originals cannot be written into a session that does not own the photo.
+    - Files are written to /uploads/originals/{session_id}/ so this path agrees
+      with the one ingest used to build `original_url`. Previously this wrote to
+      a flat directory while ingest wrote to a session subdirectory, and
+      mark_original_synced() then overwrote the session-scoped URL with the flat
+      one — leaving PDF export unable to locate the file.
+    - The body is streamed to disk in chunks instead of `await file.read()`,
+      which loaded a full 20 MB original into memory per concurrent request.
+
+    Stage 1.3 changes:
+    - Bytes go through STORAGE, so switching to S3 needs no change here.
+    - A per-session byte cap is enforced mid-copy against the running total on
+      sessions.total_bytes.
     """
-    if photo_id not in PHOTO_STORE:
-        # Create fallback photo_id if not present
-        logger.info(f"[Background HD Sync] photo_id {photo_id} not in store. Registering new photo.")
-    
-    content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="Original HD file exceeds 20MB limit.")
+    session_row = SessionStore.get_session(session_id)
+    if not session_row:
+        raise HTTPException(status_code=404, detail="Unknown or expired session.")
 
-    file_ext = Path(file.filename).suffix or ".jpg"
+    owning_session = SessionStore.get_photo_session(photo_id)
+    if owning_session is None:
+        raise HTTPException(status_code=404, detail=f"Unknown photo_id: {photo_id}")
+    if owning_session != session_id:
+        logger.warning(
+            f"[Background HD Sync] Rejected cross-session write: photo {photo_id} "
+            f"belongs to {owning_session}, caller claimed {session_id}"
+        )
+        raise HTTPException(status_code=403, detail="Photo does not belong to this session.")
+
+    # Per-session disk cap. Checked against the running total on
+    # sessions.total_bytes rather than walking storage, which is far too slow to
+    # do per request at the load target.
+    used_bytes = int(session_row.get("total_bytes") or 0) if session_row else 0
+    if used_bytes >= MAX_BYTES_PER_SESSION:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Session storage limit reached ({MAX_BYTES_PER_SESSION // 1024**3} GB)."
+        )
+
+    file_ext = Path(file.filename or "").suffix or ".jpg"
     orig_filename = f"{photo_id}_orig{file_ext}"
-    orig_path = UPLOADS_ORIGINALS_DIR / orig_filename
+    key = storage_key("originals", session_id, orig_filename)
 
-    with open(orig_path, "wb") as buffer:
-        buffer.write(content)
+    # Enforce the size cap *during* the copy so an oversized upload never fully
+    # lands on disk. put_stream_iter cleans up the partial file if this raises.
+    bytes_written = 0
 
-    orig_url_path = f"/uploads/originals/{orig_filename}"
+    def _capped_chunks():
+        nonlocal bytes_written
+        while True:
+            chunk = file.file.read(1024 * 1024)
+            if not chunk:
+                break
+            bytes_written += len(chunk)
+            if bytes_written > MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Original HD file exceeds {MAX_FILE_SIZE // (1024 * 1024)}MB limit."
+                )
+            if used_bytes + bytes_written > MAX_BYTES_PER_SESSION:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Session storage limit reached ({MAX_BYTES_PER_SESSION // 1024**3} GB)."
+                )
+            yield chunk
 
-    if photo_id in PHOTO_STORE:
-        PHOTO_STORE[photo_id].original_url = orig_url_path
-        PHOTO_STORE[photo_id].original_synced = True
+    orig_url_path = STORAGE.put_stream_iter(key, _capped_chunks())
+    SessionStore.add_session_bytes(session_id, bytes_written)
+
+    cached = get_cached_photo(photo_id)
+    if cached is not None:
+        cached.original_url = orig_url_path
+        cached.original_synced = True
+        cache_photo(cached)
     SessionStore.mark_original_synced(photo_id, orig_url_path)
 
-    logger.info(f"[Background HD Sync] Successfully synced original HD file for {photo_id} ({len(content)/(1024*1024):.2f}MB)")
+    logger.info(
+        f"[Background HD Sync] Synced original for {photo_id} in session {session_id} "
+        f"({bytes_written / (1024 * 1024):.2f}MB)"
+    )
     return {
         "status": "success",
+        "session_id": session_id,
         "photo_id": photo_id,
         "original_url": orig_url_path,
         "synced": True
     }
 
-async def process_async_job(job_id: str, photo_ids: List[str], user_prompt: str):
-    """Background async worker bounded by CONCURRENCY_SEMAPHORE with fail-safe recovery."""
+def _update_job(
+    job_id: str,
+    progress: int,
+    message: str,
+    status_value: str = "processing",
+    result: Optional[GenerateVariationsResponse] = None,
+    session_id: Optional[str] = None,
+) -> None:
+    """Mutates a cached job and persists it. Safe if the cache has evicted it."""
+    job = get_cached_job(job_id) or SessionStore.get_job(job_id)
+    if job is None:
+        logger.warning(f"[JobWorker] Job {job_id} vanished; cannot record '{message}'")
+        return
+    job.progress = progress
+    job.message = message
+    job.status = status_value
+    if result is not None:
+        job.result = result
+    cache_job(job)
+    SessionStore.save_job(job, session_id=session_id)
+
+
+def _load_job_photos(session_id: Optional[str], photo_ids: List[str]) -> List[PhotoMeta]:
+    """
+    Loads the job's photos. Runs on a pool thread — it does SQLite I/O.
+
+    Stage 1.4 Task 6: when session_id is known this is ONE indexed query
+    (idx_photos_session), instead of get_photos() chunking the id list into
+    `IN (...)` clauses of 500. It also returns capture-time order, which is what
+    chaptering needs.
+    """
+    if session_id:
+        photos = SessionStore.get_session_photos(session_id)
+        if photos:
+            return photos
+        logger.warning(f"[JobWorker] Session {session_id} has no persisted photos; falling back to id list.")
+    return SessionStore.get_photos(photo_ids) if photo_ids else []
+
+
+async def process_async_job(
+    job_id: str,
+    photo_ids: List[str],
+    user_prompt: str,
+    session_id: Optional[str] = None,
+):
+    """
+    Background worker, bounded by CONCURRENCY_SEMAPHORE.
+
+    Stage 1.4: the photo load, the theme engine and the layout solver all used
+    to run synchronously in this coroutine — directly on the event loop. For a
+    1,000-photo session the DSA solver blocks for seconds, during which the
+    server answers nobody, so one user generating stalled all twenty. Each
+    blocking stage is now handed to CPU_WORKER_POOL via run_in_executor.
+
+    The `await asyncio.sleep(0.1)` calls are gone: they existed only to let the
+    loop breathe between blocking sections, which run_in_executor makes moot.
+    """
     job_start = time.perf_counter()
-    logger.info(f"[JobWorker] Starting job {job_id} for prompt: '{user_prompt}' with {len(photo_ids)} photos.")
+    logger.info(
+        f"[JobWorker] Starting {job_id} | session={session_id} | "
+        f"prompt='{user_prompt}' | {len(photo_ids)} photo ids"
+    )
 
     async with CONCURRENCY_SEMAPHORE:
+        loop = asyncio.get_running_loop()
         try:
-            # Step 1: Update progress (30%)
-            if job_id in JOBS_STORE:
-                JOBS_STORE[job_id].progress = 30
-                JOBS_STORE[job_id].message = "Analyzing photo colors and story context..."
-                SessionStore.save_job(JOBS_STORE[job_id])
-            await asyncio.sleep(0.1)
+            _update_job(job_id, 20, "Loading photos...", session_id=session_id)
+            photos = await loop.run_in_executor(
+                CPU_WORKER_POOL, _load_job_photos, session_id, photo_ids
+            )
+            cache_photos(photos)
 
-            # Load photos from in-memory cache first, fall back to SQLite SessionStore
-            photos = [PHOTO_STORE[pid] for pid in photo_ids if pid in PHOTO_STORE]
-            if len(photos) < len(photo_ids):
-                db_photos = SessionStore.get_photos(photo_ids)
-                if db_photos:
-                    photos = db_photos
-                    for p in db_photos:
-                        PHOTO_STORE[p.id] = p
-
+            # Stage 1.6: fail honestly. This used to fabricate four `sample_N`
+            # placeholder photos and produce a COMPLETE fake photobook — turning
+            # a data-loss bug into a silently wrong product a user could pay to
+            # print. It also masked exactly the failures the load test exists to
+            # find.
             if not photos:
-                logger.warning(f"[JobWorker] No matching photos in store for job {job_id}. Using multi-sample fallbacks.")
-                photos = [
-                    PhotoMeta(
-                        id="sample_1", filename="sample1.jpg", url="/uploads/sample1.jpg",
-                        width=1200, height=900, aspect_ratio=1.33,
-                        dominant_colors=["#FAF9F6", "#D4A373", "#3C3D37"]
-                    ),
-                    PhotoMeta(
-                        id="sample_2", filename="sample2.jpg", url="/uploads/sample2.jpg",
-                        width=1200, height=900, aspect_ratio=1.33,
-                        dominant_colors=["#E1EBF0", "#4A6B82", "#1C2B36"]
-                    ),
-                    PhotoMeta(
-                        id="sample_3", filename="sample3.jpg", url="/uploads/sample3.jpg",
-                        width=1200, height=900, aspect_ratio=1.33,
-                        dominant_colors=["#F0E1EB", "#824A6B", "#361C2B"]
-                    ),
-                    PhotoMeta(
-                        id="sample_4", filename="sample4.jpg", url="/uploads/sample4.jpg",
-                        width=1200, height=900, aspect_ratio=1.33,
-                        dominant_colors=["#EBE1F0", "#6B4A82", "#2B1C36"]
-                    )
-                ]
-
-            # Step 2: Gemini AI Theme batch (60%)
-            if job_id in JOBS_STORE:
-                JOBS_STORE[job_id].progress = 60
-                JOBS_STORE[job_id].message = "Running Gemini AI theme & caption engine..."
-                SessionStore.save_job(JOBS_STORE[job_id])
-            ai_batch = generate_story_theme_batch(user_prompt, total_photos=len(photos))
-            await asyncio.sleep(0.1)
-
-            # Step 3: Cost-Solver Layout Engine (90%)
-            if job_id in JOBS_STORE:
-                JOBS_STORE[job_id].progress = 90
-                JOBS_STORE[job_id].message = "Solving optimal layout templates & background swatches..."
-                SessionStore.save_job(JOBS_STORE[job_id])
-            variations = generate_photobook_variations_engine(photos, ai_batch)
-
-            # Step 4: Job Completed (100%)
-            elapsed_ms = (time.perf_counter() - job_start) * 1000
-            if job_id in JOBS_STORE:
-                JOBS_STORE[job_id].progress = 100
-                JOBS_STORE[job_id].status = "completed"
-                JOBS_STORE[job_id].message = "Photobook variations generated successfully!"
-                JOBS_STORE[job_id].result = GenerateVariationsResponse(
-                    theme_name=ai_batch.get("primary_theme", "Devotional / Temple"),
-                    variations=variations
+                logger.error(
+                    f"[JobWorker] {job_id} has no valid photos "
+                    f"(session={session_id}, {len(photo_ids)} ids requested)"
                 )
-                SessionStore.save_job(JOBS_STORE[job_id])
+                _update_job(
+                    job_id, 100,
+                    "No valid photos found for this session. Please upload photos and try again.",
+                    status_value="failed", session_id=session_id,
+                )
+                return
+
+            _update_job(job_id, 45, "Generating story themes...", session_id=session_id)
+            ai_batch = await loop.run_in_executor(
+                CPU_WORKER_POOL, generate_story_theme_batch, user_prompt, len(photos)
+            )
+
+            _update_job(job_id, 70, "Solving optimal layouts...", session_id=session_id)
+            variations = await loop.run_in_executor(
+                CPU_WORKER_POOL, generate_photobook_variations_engine, photos, ai_batch
+            )
+
+            if not variations:
+                _update_job(
+                    job_id, 100, "Layout solver produced no variations.",
+                    status_value="failed", session_id=session_id,
+                )
+                return
+
+            elapsed_ms = (time.perf_counter() - job_start) * 1000
+            _update_job(
+                job_id, 100, "Photobook variations generated successfully!",
+                status_value="completed",
+                result=GenerateVariationsResponse(
+                    theme_name=ai_batch.get("primary_theme", "Devotional / Temple"),
+                    variations=variations,
+                ),
+                session_id=session_id,
+            )
+
             from app.metrics import MetricsCollector
             MetricsCollector.record("Full Variation Pipeline (AI + Solver)", elapsed_ms, {
                 "job_id": job_id,
                 "photos_count": len(photos),
-                "variations_count": len(variations)
+                "variations_count": len(variations),
             })
-            logger.info(f"[Metrics] Job {job_id} COMPLETED successfully in {elapsed_ms:.2f}ms | {len(variations)} Variations Generated.")
+            logger.info(
+                f"[Metrics] Job {job_id} COMPLETED in {elapsed_ms:.2f}ms | "
+                f"{len(variations)} variations from {len(photos)} photos."
+            )
         except Exception as e:
             elapsed_ms = (time.perf_counter() - job_start) * 1000
             logger.error(f"[JobWorker] Job {job_id} FAILED after {elapsed_ms:.2f}ms: {e}", exc_info=True)
             from app.metrics import MetricsCollector
             MetricsCollector.record("Failed Job Execution", elapsed_ms, {"job_id": job_id, "error": str(e)})
-            if job_id in JOBS_STORE:
-                JOBS_STORE[job_id].status = "failed"
-                JOBS_STORE[job_id].message = f"Photobook generation encountered an error: {str(e)}"
-                SessionStore.save_job(JOBS_STORE[job_id])
+            _update_job(
+                job_id, 100, f"Photobook generation encountered an error: {e}",
+                status_value="failed", session_id=session_id,
+            )
 
 @app.post("/api/generate-async", status_code=status.HTTP_202_ACCEPTED, response_model=JobStatusResponse)
 async def generate_async(payload: GenerateVariationsRequest, background_tasks: BackgroundTasks):
@@ -793,11 +1211,11 @@ async def generate_async(payload: GenerateVariationsRequest, background_tasks: B
         message="Job queued for processing...",
         result=None
     )
-    JOBS_STORE[job_id] = initial_job
-    SessionStore.save_job(initial_job)
+    cache_job(initial_job)
+    SessionStore.save_job(initial_job, session_id=payload.session_id)
 
     background_tasks.add_task(
-        process_async_job, job_id, payload.photo_ids, payload.user_prompt
+        process_async_job, job_id, payload.photo_ids, payload.user_prompt, payload.session_id
     )
 
     return initial_job
@@ -805,13 +1223,15 @@ async def generate_async(payload: GenerateVariationsRequest, background_tasks: B
 @app.get("/api/jobs/{job_id}", response_model=JobStatusResponse)
 async def get_job_status(job_id: str):
     """Polling route returning job processing status & result with DB fallback."""
-    if job_id in JOBS_STORE:
-        return JOBS_STORE[job_id]
-    
-    # Fallback to persistent SQLite DB
+    cached = get_cached_job(job_id)
+    if cached is not None:
+        return cached
+
+    # Fallback to persistent SQLite DB. A cache miss must never become a 404 —
+    # the bounded TTLCache evicts, so SQLite is the source of truth.
     db_job = SessionStore.get_job(job_id)
     if db_job:
-        JOBS_STORE[job_id] = db_job
+        cache_job(db_job)
         return db_job
 
     logger.warning(f"[API] Job ID {job_id} not found in memory or database.")
@@ -823,20 +1243,69 @@ class ExportPDFRequest(BaseModel):
     page_height_mm: float = 200.0
     bleed_mm: float = 3.0
     dpi: int = 300
+    # Stage 1.3: scopes original resolution to one session (O(1) lookup instead
+    # of an rglob across every session's uploads).
+    session_id: Optional[str] = None
+    # Deliberately export a low-resolution proof before HD originals finish.
+    force_preview: bool = False
+
+def collect_placed_photo_ids(variation: PhotobookVariation) -> List[str]:
+    """Every photo_id that actually occupies a slot in this variation."""
+    placed: List[str] = []
+    for spread in variation.spreads:
+        for page in (spread.left_page, spread.right_page):
+            for slot in page.slots:
+                if slot.photo_id and slot.photo_id not in placed:
+                    placed.append(slot.photo_id)
+    return placed
+
 
 @app.post("/api/export-pdf")
 def export_print_pdf(req: ExportPDFRequest):
     """
     Compiles 300 DPI High-Res Print PDF/X file from PhotobookVariation layout metadata.
-    Fetches HD original photos from /uploads/originals/ and embeds 3mm bleed margins.
+
+    Stage 1.3: originals now upload on demand rather than eagerly, so an export
+    can legitimately be requested before every placed photo's HD file has
+    arrived. This gate returns 409 with the outstanding count instead of quietly
+    substituting 512px thumbnails into a print-resolution PDF — which is what
+    the resolver's fallback chain would otherwise do.
+
+    Pass `force_preview=true` to deliberately export a low-resolution proof.
     """
+    placed_ids = collect_placed_photo_ids(req.variation)
+
+    if not req.force_preview and placed_ids:
+        photos = SessionStore.get_photos(placed_ids)
+        found = {p.id: p for p in photos}
+        pending = [pid for pid in placed_ids if not (found.get(pid) and found[pid].original_synced)]
+
+        if pending:
+            logger.warning(
+                f"[Export PDF] Blocked: {len(pending)}/{len(placed_ids)} placed photos "
+                f"have no HD original yet (session {req.session_id or 'unknown'})."
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "originals_pending",
+                    "pending_count": len(pending),
+                    "total_count": len(placed_ids),
+                    "message": (
+                        f"{len(pending)} of {len(placed_ids)} high-resolution photos are "
+                        f"still uploading. Print export will be available shortly."
+                    ),
+                },
+            )
+
     try:
         result = generate_print_pdf_engine(
             variation=req.variation,
             page_width_mm=req.page_width_mm,
             page_height_mm=req.page_height_mm,
             bleed_mm=req.bleed_mm,
-            dpi=req.dpi
+            dpi=req.dpi,
+            session_id=req.session_id or ""
         )
         return result
     except Exception as e:

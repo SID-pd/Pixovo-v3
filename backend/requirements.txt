@@ -25,5 +25,8 @@ google-genai>=0.1.0
 # Document & PDF Export Engine
 reportlab>=4.1.0
 
+# Bounded in-memory caches (Stage 1.4)
+cachetools>=5.3.0
+
 # Testing & Utilities
 pytest>=8.0.0

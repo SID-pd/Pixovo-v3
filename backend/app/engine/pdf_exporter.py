@@ -21,7 +21,8 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
 from app.config import (
-    BASE_DIR, UPLOADS_DIR, UPLOADS_ORIGINALS_DIR, UPLOADS_THUMBNAILS_DIR, UPLOADS_PREVIEWS_DIR, EXPORTS_DIR, logger
+    BASE_DIR, UPLOADS_DIR, UPLOADS_ORIGINALS_DIR, UPLOADS_THUMBNAILS_DIR, UPLOADS_PREVIEWS_DIR, EXPORTS_DIR, logger,
+    STORAGE, storage_key
 )
 from app.schemas.photobook import PhotobookVariation, SpreadPair
 
@@ -34,11 +35,32 @@ def hex_to_rgb(hex_str: str) -> tuple:
         hex_clean = ''.join([c*2 for c in hex_clean])
     return tuple(int(hex_clean[i:i+2], 16) for i in (0, 2, 4))
 
-def resolve_photo_path(photo_url: str, photo_id: str = "") -> Path:
+def resolve_photo_path(photo_url: str, photo_id: str = "", session_id: str = "") -> Path:
     """
     Resolves photo URL or photo ID to physical disk path with 100% HD Original priority.
     Handles session subdirectories, relative /uploads/ paths, exact files, and recursive searching.
+
+    Stage 1.3: when `session_id` is known, resolution is a direct O(1) storage
+    lookup scoped to that session. The legacy fallbacks below rglob the entire
+    uploads tree, which is both O(all files) per photo — untenable at 20,000
+    photos — and cross-session, so a partial stem match could pull another
+    session's photo into this PDF. Those paths remain only for pre-1.3 data.
     """
+    if session_id and photo_id:
+        for ext in (".jpg", ".jpeg", ".png", ".webp", ".heic", ".tif", ".tiff"):
+            hit = STORAGE.get_path(storage_key("originals", session_id, f"{photo_id}_orig{ext}"))
+            if hit:
+                return Path(hit)
+        # No original yet — fall back to the thumbnail so preview-quality export
+        # still works. The export gate in main.py is what prevents a real print
+        # job from silently shipping thumbnails.
+        thumb = STORAGE.get_path(storage_key("thumbnails", session_id, f"{photo_id}_thumb.jpg"))
+        if thumb:
+            logger.warning(
+                f"[PDF Engine] No HD original for {photo_id} in {session_id}; using thumbnail."
+            )
+            return Path(thumb)
+
     # 1. Direct absolute path check
     if photo_url and (photo_url.startswith("/") or photo_url.startswith("\\") or ":" in photo_url):
         try:
@@ -101,16 +123,25 @@ def resolve_photo_path(photo_url: str, photo_id: str = "") -> Path:
             if candidate.is_file() and not candidate.name.startswith("sample"):
                 return candidate
 
-    # 4. Fallback to sample placeholder
-    logger.warning(f"[PDF Engine WARNING] Could not resolve photo for url='{photo_url}', id='{photo_id}'. Using placeholder.")
-    return UPLOADS_DIR / "sample_placeholder.jpg"
+    # 4. Unresolvable.
+    #
+    # Stage 1.6: this used to return `sample_placeholder.jpg`, so a photo the
+    # engine could not locate was silently swapped for a stock placeholder in a
+    # PDF the user might pay to print. The Stage 1.3 export gate already
+    # verifies every placed photo has an HD original, so reaching this point is
+    # a genuine bug and must be loud.
+    raise FileNotFoundError(
+        f"Could not resolve photo file for photo_id='{photo_id}', url='{photo_url}'"
+        + (f", session='{session_id}'" if session_id else "")
+    )
 
 def generate_print_pdf_engine(
     variation: PhotobookVariation,
     page_width_mm: float = 200.0,
     page_height_mm: float = 200.0,
     bleed_mm: float = 3.0,
-    dpi: int = 300
+    dpi: int = 300,
+    session_id: str = ""
 ) -> Dict[str, Any]:
     """
     Compiles 300 DPI High-Res Print PDF/X file using ReportLab Native Vector Architecture.
@@ -170,7 +201,9 @@ def generate_print_pdf_engine(
             slot_y_bottom_pt = spread_h_pt - slot_y_top_pt - slot_h_pt
 
             if slot.type == "photo" and (slot.photo_url or slot.photo_id):
-                photo_file_path = resolve_photo_path(slot.photo_url or "", slot.photo_id or "")
+                photo_file_path = resolve_photo_path(
+                    slot.photo_url or "", slot.photo_id or "", session_id
+                )
                 try:
                     if photo_file_path.exists() and photo_file_path.is_file():
                         with Image.open(photo_file_path) as photo_img:

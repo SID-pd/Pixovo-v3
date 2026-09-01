@@ -12,6 +12,19 @@ from app.schemas.photobook import (
 from app.engine.dsa_solver import build_dsa_spread_pair, reshuffle_single_spread_engine, LAYOUT_FAMILIES, cluster_photos_2tier_engine
 from app.engine.story_ai import partition_macro_chapters
 from app.engine.color_extractor import THEME_PALETTES, calculate_yiq_text_color
+from app.engine.cover_selector import select_covers
+from app.config import logger
+
+# Stage 1.5: each variation gets a different PACING, so the three differ
+# structurally rather than only by palette. Chapter boundaries are untouched —
+# reordering them would destroy the chronological narrative that Stage 1.2's
+# data-contract fix just restored. Only spread density changes.
+VARIATION_STRATEGIES = [
+    {"name": "CHRONOLOGICAL", "chunk_size": 3},  # story order, even spreads
+    {"name": "HERO_FORWARD", "chunk_size": 2},   # tighter spreads, photos larger
+    {"name": "EXPANSIVE", "chunk_size": 4},      # denser collages, more per spread
+]
+
 
 def generate_photobook_variations_engine(
     photos: List[PhotoMeta],
@@ -21,6 +34,9 @@ def generate_photobook_variations_engine(
     """
     Generates exactly 3 distinct persistent Photobook Variations applying
     2-Tier Intelligent Clustering (Macro Chapters + Micro pHash Spread Matching) and DSA Solver.
+
+    Deterministic: no randomness anywhere in this path, so identical input always
+    yields identical output. The golden tests depend on that.
     """
     variations_data = ai_batch_result.get("variations", [])
     result_variations: List[PhotobookVariation] = []
@@ -29,6 +45,11 @@ def generate_photobook_variations_engine(
 
     # Tier 1: Macro Temporal + GPS Story Chapters
     macro_chapters = partition_macro_chapters(photos)
+
+    # Cover sets are chosen ONCE across all variations so no photo appears on
+    # more than one cover. Choosing per-variation would hand every variation the
+    # same top-ranked hero.
+    cover_sets = select_covers(photos, variation_count=3)
 
     for var_idx in range(3):
         if var_idx < len(variations_data):
@@ -49,6 +70,7 @@ def generate_photobook_variations_engine(
         ])
         
         family_variant = LAYOUT_FAMILIES[(var_idx + variant_seed_offset) % len(LAYOUT_FAMILIES)]
+        strategy = VARIATION_STRATEGIES[var_idx % len(VARIATION_STRATEGIES)]
         spreads: List[SpreadPair] = []
         spread_idx = 1
 
@@ -56,7 +78,13 @@ def generate_photobook_variations_engine(
         for ch in macro_chapters:
             ch_photos = ch.get("photos", [])
             ch_title = ch.get("chapter_title", "")
-            photo_chunks = cluster_photos_2tier_engine(ch_photos, chunk_size=2 if len(ch_photos) <= 4 else 3)
+            # Stage 1.5: chunk size comes from the variation's pacing strategy.
+            # It was hardcoded to `2 if len(ch_photos) <= 4 else 3` for every
+            # variation, so all three had identical spread structure.
+            chunk_size = strategy["chunk_size"]
+            if len(ch_photos) <= 4:
+                chunk_size = max(2, chunk_size - 1)
+            photo_chunks = cluster_photos_2tier_engine(ch_photos, chunk_size=chunk_size)
 
             for c_i, chunk in enumerate(photo_chunks):
                 # Spread caption: Chapter title on first spread of chapter, varied caption on subsequent spreads
@@ -76,20 +104,44 @@ def generate_photobook_variations_engine(
                 spreads.append(spread)
                 spread_idx += 1
 
-        cover_img = photos[0].url if photos else "/uploads/sample_placeholder.jpg"
-        
+        # Stage 1.5: hero-ranked, non-overlapping cover set for this variation.
+        # Was `photos[0].url` — the same upload-order photo for all three, with a
+        # sample placeholder when the list was empty.
+        cover = cover_sets[var_idx] if var_idx < len(cover_sets) else {"cover_style": "SPLIT_BANNER", "cover_photos": []}
+        cover_photos = cover["cover_photos"]
+
         variation = PhotobookVariation(
             id=f"var_{var_idx + 1}",
             variation_title=var_info.get("variation_title", f"{theme_name} Style {var_idx + 1}"),
             theme_name=theme_name,
-            cover_title=var_info.get("cover_title", "KANPUR TEMPLE VISIT"),
-            cover_subtitle=var_info.get("cover_subtitle", "2025 • MEMORIES"),
-            cover_image_url=cover_img,
+            # These defaults were leftovers from one specific test session
+            # ("KANPUR TEMPLE VISIT" / "2025 • MEMORIES") and appeared verbatim
+            # whenever the AI batch omitted a title.
+            cover_title=var_info.get("cover_title") or "YOUR PHOTOBOOK",
+            cover_subtitle=var_info.get("cover_subtitle") or "A COLLECTION OF MEMORIES",
+            cover_style=cover["cover_style"],
+            cover_photos=cover_photos,
+            cover_image_url=cover_photos[0].url if cover_photos else "",
             base_color=palette["background"],
             accent_color=palette["accent"],
             text_color=palette["text"],
             spreads=spreads
         )
         result_variations.append(variation)
+
+    signatures = [
+        tuple(len(s.left_page.slots) + len(s.right_page.slots) for s in v.spreads)
+        for v in result_variations
+    ]
+    logger.info(
+        f"[Solver] Generated {len(result_variations)} variations | "
+        f"spread counts {[len(v.spreads) for v in result_variations]} | "
+        f"distinct structures {len(set(signatures))}/3"
+    )
+    if len(set(signatures)) == 1 and len(result_variations) > 1:
+        logger.warning(
+            "[Solver] All variations have identical spread structure — "
+            "pacing strategies had no effect (too few photos per chapter?)."
+        )
 
     return result_variations

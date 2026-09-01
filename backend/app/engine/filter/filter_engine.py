@@ -11,13 +11,12 @@ Multi-Layered High-Precision Filtering Pipeline:
 
 import os
 import re
+import threading
 import math
 import time
-import gc
 import base64
 from datetime import datetime
 from typing import List, Dict, Any, Tuple
-from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 from PIL import Image, ImageOps
@@ -598,6 +597,45 @@ class Phase1FilterEngine:
         except Exception:
             return ""
 
+    def compute_dominant_colors_from_array(self, small_bgr, num_colors: int = 3) -> List[str]:
+        """
+        Extracts dominant colours from the already-decoded preview array.
+
+        Stage 1.2: ingest previously hardcoded dominant_colors to the same two
+        hex values for every photo. color_extractor.extract_dominant_colors()
+        exists but takes a path and would re-decode the file; doing it here
+        reuses the array process_single_photo has already loaded, so the
+        marginal cost is a 64x64 resize plus a tiny k-means.
+
+        Returned darkest-first so callers get a stable ordering.
+        """
+        try:
+            pixels = cv2.resize(small_bgr, (64, 64), interpolation=cv2.INTER_AREA)
+            pixels = pixels.reshape(-1, 3).astype(np.float32)
+
+            k = max(1, min(num_colors, len(np.unique(pixels, axis=0))))
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+            _, labels, centers = cv2.kmeans(
+                pixels, k, None, criteria, 3, cv2.KMEANS_PP_CENTERS
+            )
+
+            counts = np.bincount(labels.flatten(), minlength=k)
+            order = np.argsort(-counts)  # most populous cluster first
+
+            hex_colors = []
+            for idx in order:
+                b, g, r = centers[idx]
+                hex_colors.append("#{:02X}{:02X}{:02X}".format(
+                    int(np.clip(r, 0, 255)), int(np.clip(g, 0, 255)), int(np.clip(b, 0, 255))
+                ))
+            # Pad short results so downstream palette indexing is always safe.
+            while len(hex_colors) < num_colors:
+                hex_colors.append(hex_colors[-1] if hex_colors else "#2C3E50")
+            return hex_colors[:num_colors]
+        except Exception as e:
+            logger.warning(f"[Filter] Dominant colour extraction failed: {e}")
+            return ["#2C3E50", "#ECF0F1", "#7F8C8D"][:num_colors]
+
     def process_single_photo(self, filepath: str, photo_id: str) -> Dict[str, Any]:
         """
         Scan single photo:
@@ -659,6 +697,7 @@ class Phase1FilterEngine:
             hero_score, layout_role = self.compute_hero_score(
                 aspect_ratio, width, face_count, major_face_count, face_quality, focal_blur, contrast_score, entropy
             )
+            dominant_colors = self.compute_dominant_colors_from_array(small_bgr, num_colors=3)
 
             # Clean memory buffer reference
             del small_bgr
@@ -674,6 +713,7 @@ class Phase1FilterEngine:
                 "orientation": orientation,
                 "hero_score": hero_score,
                 "layout_role": layout_role,
+                "dominant_colors": dominant_colors,
                 "taken_at": meta["taken_at"],
                 "formatted_date": meta["formatted_date"],
                 "date_source": meta["date_source"],
@@ -999,20 +1039,38 @@ class Phase1FilterEngine:
         return layout_groups
 
     def run_phase1_filtering(self, filepaths: List[str]) -> Dict[str, Any]:
-        """Execute full 6-Layer Precision Filtering & Pairing Pipeline."""
-        max_workers = min(4, os.cpu_count() or 2)
-        scanned_photos = []
+        """
+        Execute the full 6-layer pipeline serially.
 
-        chunk_size = 50
-        for i in range(0, len(filepaths), chunk_size):
-            chunk_fps = filepaths[i:i+chunk_size]
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [
-                    executor.submit(self.process_single_photo, fp, f"p_{i+idx+1}")
-                    for idx, fp in enumerate(chunk_fps)
-                ]
-                scanned_photos.extend([f.result() for f in futures])
-            gc.collect()
+        Stage 1.4: this used to construct its own ThreadPoolExecutor per call.
+        Since the caller already invokes it on a pool thread, that meant
+        FILTER_WORKERS x 4 threads — plus OpenCV's own per-operation fan-out —
+        competing for a machine with far fewer cores.
+
+        Prefer `finalise_batch()` with per-photo work fanned out by the caller
+        (see main.py ingest): that parallelises across concurrent sessions
+        instead of nesting pools inside one. This method is kept for callers
+        that want the whole pipeline in one synchronous call, and for tests.
+        """
+        scanned_photos = [
+            self.process_single_photo(fp, f"p_{idx + 1}")
+            for idx, fp in enumerate(filepaths)
+        ]
+        return self.finalise_batch(scanned_photos, total_uploaded=len(filepaths))
+
+    def finalise_batch(
+        self, scanned_photos: List[Dict[str, Any]], total_uploaded: int = 0
+    ) -> Dict[str, Any]:
+        """
+        Serial post-processing over an already-scanned batch.
+
+        Everything here is cross-photo and cheap (no image decoding, no I/O):
+        the solo-anchor safeguard, burst dedupe, event clustering (DBSCAN),
+        layout grouping and hero ranking. Split out from run_phase1_filtering so
+        the expensive per-photo half can be fanned out by the caller while this
+        half stays serial — and so both halves are independently testable.
+        """
+        total_uploaded = total_uploaded or len(scanned_photos)
 
         # Uniqueness Safeguard (Solo Anchor Protection)
         for p in scanned_photos:
@@ -1119,7 +1177,7 @@ class Phase1FilterEngine:
 
         return {
             "summary": {
-                "total_uploaded": len(filepaths),
+                "total_uploaded": total_uploaded,
                 "total_survived": len(survived_photos),
                 "total_events": len(events),
                 "total_rejected": len(junk_rejected) + len(blurry_rejected) + len(exposure_rejected) + len(corrupt_rejected) + len(burst_rejected),
@@ -1136,3 +1194,54 @@ class Phase1FilterEngine:
             "all_scanned_photos": scanned_photos
         }
 
+
+
+# ----------------------------------------------------------------------
+# Module-level worker entry points (Stage 1.7)
+# ----------------------------------------------------------------------
+# ProcessPoolExecutor pickles the callable it is handed. Submitting a BOUND
+# method (engine.process_single_photo) pickles the Phase1FilterEngine instance
+# with it, which holds loaded mediapipe/ONNX handles — ctypes function pointers.
+# That fails with:
+#
+#   Can't pickle local object 'CDLL.__init__.<locals>._FuncPtr'
+#
+# These module-level functions are picklable by reference. Each worker process
+# builds its own engine on first use (~1-2s of model loading, once per worker)
+# and reuses it thereafter. Both are safe for the thread pool too, where the
+# module global is simply shared.
+
+# One engine PER THREAD, not one per process.
+#
+# Phase1FilterEngine holds a FaceDetector wrapping MediaPipe/TFLite and ONNX
+# Runtime sessions. Those carry native graph state and are NOT safe to call
+# concurrently from multiple threads: sharing a single instance across the pool
+# crashed the interpreter outright (no Python traceback, exit 127) as soon as
+# ~8 concurrent sessions were filtering at once. Lower concurrency masked it,
+# which is why it survived a 4-user run.
+#
+# A lock around detection would serialise the most expensive stage and destroy
+# throughput, so each pool thread gets its own detector instead. Under a
+# ProcessPoolExecutor each worker process has exactly one thread, so this
+# degrades naturally to one engine per process.
+_ENGINE_TLS = threading.local()
+
+
+def _worker_engine() -> "Phase1FilterEngine":
+    engine = getattr(_ENGINE_TLS, "engine", None)
+    if engine is None:
+        engine = Phase1FilterEngine()
+        _ENGINE_TLS.engine = engine
+    return engine
+
+
+def scan_photo(filepath: str, photo_id: str) -> Dict[str, Any]:
+    """Per-photo scan. Pool-safe entry point for the expensive half."""
+    return _worker_engine().process_single_photo(filepath, photo_id)
+
+
+def finalise_scanned_batch(
+    scanned_photos: List[Dict[str, Any]], total_uploaded: int = 0
+) -> Dict[str, Any]:
+    """Serial cross-photo half. Pool-safe entry point."""
+    return _worker_engine().finalise_batch(scanned_photos, total_uploaded=total_uploaded)

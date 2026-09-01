@@ -32,16 +32,21 @@ function openDB() {
 
 /**
  * Saves original file blob to IndexedDB linked to photoId.
+ *
+ * `sessionId` is stored alongside the blob so that after a page refresh the
+ * auto-resume path knows which session to upload it into. Without it a queued
+ * blob could not be attributed to a session and would retry forever.
  */
-export async function saveOriginalBlob(photoId, fileBlob) {
+export async function saveOriginalBlob(photoId, fileBlob, sessionId = null) {
   try {
     const db = await openDB();
     return new Promise((resolve, reject) => {
       const transaction = db.transaction([STORE_NAME], 'readwrite');
       const store = transaction.objectStore(STORE_NAME);
-      
+
       const record = {
         photoId,
+        sessionId,
         blob: fileBlob,
         filename: fileBlob.name,
         timestamp: Date.now()
@@ -74,6 +79,43 @@ export async function getPendingBlobs() {
   } catch (err) {
     console.warn("[IndexedDB] Failed to get pending blobs:", err);
     return [];
+  }
+}
+
+/**
+ * Drops records older than `maxAgeMs` (default 24h).
+ *
+ * Stage 1.3: an abandoned session used to leave its full-resolution blobs in
+ * the user's browser storage forever — potentially gigabytes, and IndexedDB
+ * quota exhaustion silently breaks the next upload's crash-safety net.
+ * Returns the number of records evicted.
+ */
+export async function sweepStaleBlobs(maxAgeMs = 24 * 60 * 60 * 1000) {
+  try {
+    const db = await openDB();
+    const cutoff = Date.now() - maxAgeMs;
+
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction([STORE_NAME], 'readwrite');
+      const store = transaction.objectStore(STORE_NAME);
+      const req = store.getAll();
+
+      req.onsuccess = () => {
+        const stale = (req.result || []).filter(r => !r.timestamp || r.timestamp < cutoff);
+        stale.forEach(r => store.delete(r.photoId));
+        transaction.oncomplete = () => {
+          if (stale.length > 0) {
+            console.log(`[IndexedDB] Swept ${stale.length} stale original blob(s).`);
+          }
+          resolve(stale.length);
+        };
+        transaction.onerror = (e) => reject(e.target.error);
+      };
+      req.onerror = (e) => reject(e.target.error);
+    });
+  } catch (err) {
+    console.warn('[IndexedDB] Sweep failed:', err);
+    return 0;
   }
 }
 

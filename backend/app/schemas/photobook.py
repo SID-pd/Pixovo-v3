@@ -20,6 +20,36 @@ class PhotoMeta(BaseModel):
     core_phash: Optional[str] = ""
     is_hero_candidate: Optional[bool] = False
 
+    # ------------------------------------------------------------------
+    # Stage 1.2 — the filter engine's output, carried through to the solver.
+    #
+    # These fields existed only inside filter_engine's per-photo dicts and were
+    # dropped when PhotoMeta was constructed at ingest, which left four
+    # downstream systems running on nulls:
+    #   shell_phash/core_phash -> cluster_photos_2tier_engine (spread grouping)
+    #   timestamp_epoch/lat/lon -> partition_macro_chapters (story chapters)
+    #   hero_score              -> cover selection
+    #   dominant_colors         -> colour theming
+    # ------------------------------------------------------------------
+
+    # Temporal / geographic — drives partition_macro_chapters()
+    timestamp_epoch: Optional[float] = 0.0   # epoch seconds; 0 == unknown
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+    # Layout intelligence — drives hero selection and slot sizing
+    hero_score: Optional[float] = 0.0        # 0-100, from compute_hero_score()
+    # DOUBLE_PAGE_HERO (>=75 & landscape) | FULL_PAGE_HERO (>=62) | STANDARD_FRAME
+    layout_role: Optional[str] = "STANDARD_FRAME"
+    # Advisory only: the filter engine runs per ingest chunk, so this flag is
+    # chunk-local. Session-wide cover selection must rank on hero_score, which
+    # is computed per photo independently and is therefore globally comparable.
+    is_event_cover_hero: Optional[bool] = False
+
+    # Additional quality signals
+    tenengrad_score: Optional[float] = None
+    contrast_score: Optional[float] = None
+
 class TemplateSlot(BaseModel):
     id: str
     type: str  # "photo" or "text"
@@ -54,13 +84,34 @@ class SpreadPair(BaseModel):
     left_page: SinglePage
     right_page: SinglePage
 
+class CoverPhoto(BaseModel):
+    """One photo occupying a slot on a cover."""
+    photo_id: str
+    url: str                        # thumbnail URL — never the full-res original
+    aspect_ratio: float = 1.33
+    hero_score: float = 0.0
+
+
 class PhotobookVariation(BaseModel):
     id: str
     variation_title: str
     theme_name: str
     cover_title: str
     cover_subtitle: str
-    cover_image_url: str
+
+    # Stage 1.5: covers were a single `cover_image_url: str`, so the API could
+    # not express a multi-photo cover at all. The frontend's "4-photo collage"
+    # rendered that one URL four times, and all three variations received the
+    # same photo (`photos[0]`, upload order) — which is why the covers read as
+    # dummy placeholders.
+    #
+    # cover_style is chosen by the backend because only the producer knows how
+    # many photos it supplied; the frontend previously guessed via `idx % 3`.
+    cover_style: str = "SPLIT_BANNER"          # SPLIT_BANNER | HERO_BAND | COLLAGE_2X2
+    cover_photos: List[CoverPhoto] = Field(default_factory=list)
+    # DEPRECATED: mirrors cover_photos[0].url so nothing breaks mid-migration.
+    cover_image_url: str = ""
+
     base_color: str
     accent_color: str
     text_color: str
@@ -69,6 +120,9 @@ class PhotobookVariation(BaseModel):
 class GenerateVariationsRequest(BaseModel):
     photo_ids: List[str]
     user_prompt: str = ""
+    # Stage 1.4: lets the job worker load photos with one indexed query instead
+    # of chunking the id list into `IN (...)` clauses of 500.
+    session_id: Optional[str] = None
 
 class GenerateVariationsResponse(BaseModel):
     theme_name: str
